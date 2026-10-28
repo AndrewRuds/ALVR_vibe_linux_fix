@@ -624,9 +624,12 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
                 .width = desc.nWidth,
                 .height = desc.nHeight,
             },
+            // The stream size negotiated with the headset, not the size
+            // SteamVR renders at: the two differ when the emulated headset
+            // resolution is changed, and the headset only decodes the first.
             .outputExtent {
-                .width = settings->m_recommendedTargetWidth,
-                .height = settings->m_recommendedTargetHeight,
+                .width = settings->m_renderWidth,
+                .height = settings->m_renderHeight,
             },
             .inputImgFds = fds,
         };

@@ -67,6 +67,10 @@ struct RendererCreateInfo {
     std::array<int, ImageCount> inputImgFds;
 };
 
+// True when this device can import SteamVR's swap textures, i.e. it is the GPU
+// SteamVR renders on. Leaves createInfo.inputImgFds untouched.
+bool canImportInputImages(VkContext const& ctx, RendererCreateInfo const& createInfo);
+
 // Push-constant payload for the rotational reprojection fold in the sampling
 // shaders. Field offsets must match the GLSL block (0/64/80/96). enabled == 0
 // reproduces the unwarped sampling exactly, so a zero-initialized struct is a

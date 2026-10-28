@@ -1451,7 +1451,7 @@ fn connection_pipeline(
         .send(ServerCoreEvent::ClientConnected(
             ServerNegotiatedStreamingConfig {
                 transcoding_view_resolution,
-                emulated_headset_view_resolution: transcoding_view_resolution,
+                emulated_headset_view_resolution,
                 refresh_rate: fps as _,
                 foveated_encoding,
                 codec,

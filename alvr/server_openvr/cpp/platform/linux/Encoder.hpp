@@ -99,7 +99,8 @@ inline auto makeFoveation(Settings const& settings) {
 class Encoder {
     vk::Extent2D outExtent;
 
-    VkContext vkCtx;
+    // Built on first use, on the GPU SteamVR renders on (see selectDevice).
+    Optional<VkContext> vkCtxOpt;
 
     Optional<render::Renderer> renderer;
 
@@ -114,16 +115,70 @@ class Encoder {
     // unwarped, which is worse than not warping at all.
     bool warpCapableChain = false;
 
+    VkContext& ctx() { return vkCtxOpt.get(); }
+
+    void destroyContext() {
+        if (vkCtxOpt.hasValue()) {
+            vkCtxOpt.get().destroy();
+            vkCtxOpt.reset();
+        }
+    }
+
+    // Direct mode gives no hint about which GPU SteamVR uses, and a texture
+    // from one GPU cannot be imported on another. Taking the first device, as
+    // before, picks the integrated GPU on most laptops while SteamVR renders
+    // on the discrete one, which leaves the headset black. Try the devices in
+    // order and keep the first that can import the swap textures.
+    void selectDevice(render::RendererCreateInfo const& rendererCI) {
+        if (vkCtxOpt.hasValue() && render::canImportInputImages(ctx(), rendererCI)) {
+            return;
+        }
+        destroyContext();
+
+        for (auto idx : VkContext::candidateDeviceIndices()) {
+            try {
+                vkCtxOpt.emplace(idx);
+            } catch (std::exception const& e) {
+                Warn("Could not create Vulkan context on device %u: %s\n", idx, e.what());
+                continue;
+            }
+            if (render::canImportInputImages(ctx(), rendererCI)) {
+                Info(
+                    "Encoding on Vulkan device %u: %s\n",
+                    idx,
+                    ctx().physDev.getProperties().deviceName.data()
+                );
+                return;
+            }
+            Info("Vulkan device %u cannot import SteamVR textures, trying the next one\n", idx);
+            destroyContext();
+        }
+
+        throw std::runtime_error(
+            "no Vulkan device can import SteamVR's textures. On a laptop with two GPUs, run "
+            "SteamVR on the discrete GPU (for NVIDIA: prime-run or "
+            "__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia in its launch options)"
+        );
+    }
+
 public:
-    // TODO: How are we supposed to match the physical device with direct mode?
-    Encoder()
-        : vkCtx(std::vector<u8> {}) { }
+    Encoder() = default;
 
     void createImages(render::RendererCreateInfo rendererCI) {
+        // The old pipeline and frame reference the old renderer's output, and
+        // possibly another device, so drop them before anything else.
+        if (vkCtxOpt.hasValue()) {
+            ctx().dev.waitIdle();
+        }
+        encoder.reset();
+        frame.reset();
         if (renderer.hasValue()) {
-            renderer.get().destroy(vkCtx);
+            renderer.get().destroy(ctx());
             renderer.reset();
         }
+
+        selectDevice(rendererCI);
+        auto& vkCtx = ctx();
 
         auto const& settings = Settings_Instance();
 
@@ -161,7 +216,7 @@ public:
     }
 
     void initEncoding() {
-        auto const& settings = Settings_Instance();
+        auto& vkCtx = ctx();
 
         VkPhysicalDeviceDrmPropertiesEXT drmProps = {};
         drmProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
@@ -224,12 +279,14 @@ public:
         // path leaves Vulkan work in flight, but the Nvidia path signals the
         // frame's semaphore from a queue submission and will need this when
         // it comes back.
-        vkCtx.dev.waitIdle();
+        if (vkCtxOpt.hasValue()) {
+            ctx().dev.waitIdle();
+        }
 
         encoder.reset();
         frame.reset();
         if (renderer.hasValue()) {
-            renderer.get().destroy(vkCtx);
+            renderer.get().destroy(ctx());
             renderer.reset();
         }
         encoderMissingLogged = false;
@@ -260,7 +317,7 @@ public:
         renderer.get().warpParams = warp;
         ReportPresent(targetTimestampNs, 0);
         updateFoveationCenters(targetTimestampNs);
-        renderer.get().render(vkCtx, leftIdx, rightIdx, waitFds);
+        renderer.get().render(ctx(), leftIdx, rightIdx, waitFds);
         ReportComposed(targetTimestampNs, 0);
 
         encoder->SetParams(GetDynamicEncoderParams());
@@ -268,7 +325,9 @@ public:
 
         alvr::FramePacket framePacket;
         if (!encoder->GetEncoded(framePacket)) {
-            assert(false);
+            // No packet for this frame. Sending framePacket anyway would hand
+            // uninitialized memory to the NAL parser.
+            return;
         }
 
         ParseFrameNals(
@@ -322,11 +381,11 @@ public:
         frame.reset();
 
         if (renderer.hasValue()) {
-            renderer.get().destroy(vkCtx);
+            renderer.get().destroy(ctx());
             renderer.reset();
         }
 
-        vkCtx.destroy();
+        destroyContext();
     }
 };
 

@@ -438,36 +438,30 @@ Output createOutputImage(
     return out;
 }
 
-namespace alvr::render {
+// UNORM twin of an sRGB swap texture format; other formats map to themselves.
+static vk::Format unormFormatOf(vk::Format format) {
+    if (format == vk::Format::eR8G8B8A8Srgb)
+        return vk::Format::eR8G8B8A8Unorm;
+    if (format == vk::Format::eB8G8R8A8Srgb)
+        return vk::Format::eB8G8R8A8Unorm;
+    return format;
+}
 
-Renderer::Renderer(
-    VkContext const& vkCtx, RendererCreateInfo& createInfo, std::vector<PipelineCreateInfo> pipeCIs
-) {
-    eyeExtent = createInfo.inputEyeExtent;
-    outExtent = createInfo.outputExtent;
-
-    // The import must match how SteamVR created the image: its real format
-    // and MUTABLE_FORMAT (passed in CreateSwapTextureSet), and no format list
-    // since SteamVR's image has none. A list could let the driver choose a
-    // different memory layout (e.g. compression) than the exporter did.
-    // MUTABLE_FORMAT is what makes the UNORM view of an sRGB image legal.
-    vk::Format inputFormat = createInfo.format;
-    vk::Format unormFormat = createInfo.format;
-    if (inputFormat == vk::Format::eR8G8B8A8Srgb)
-        unormFormat = vk::Format::eR8G8B8A8Unorm;
-
-    if (inputFormat == vk::Format::eB8G8R8A8Srgb)
-        unormFormat = vk::Format::eB8G8R8A8Unorm;
-
+// The import must match how SteamVR created the image: its real format
+// and MUTABLE_FORMAT (passed in CreateSwapTextureSet), and no format list
+// since SteamVR's image has none. A list could let the driver choose a
+// different memory layout (e.g. compression) than the exporter did.
+// MUTABLE_FORMAT is what makes the UNORM view of an sRGB image legal.
+static vk::ImageCreateInfo makeInputImageCI(RendererCreateInfo const& createInfo) {
     // TODO: Only put the usage flags for the images that need to have them
-    vk::ImageCreateInfo inputImgCI {
+    return vk::ImageCreateInfo {
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
-        .format = inputFormat,
+        .format = createInfo.format,
 
         .extent = {
-            .width = eyeExtent.width,
-            .height = eyeExtent.height,
+            .width = createInfo.inputEyeExtent.width,
+            .height = createInfo.inputEyeExtent.height,
             .depth = 1,
         },
 
@@ -479,6 +473,74 @@ Renderer::Renderer(
         .sharingMode = vk::SharingMode::eExclusive,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
+}
+
+namespace alvr::render {
+
+bool canImportInputImages(VkContext const& ctx, RendererCreateInfo const& createInfo) {
+    vk::ImageCreateInfo imageCI = makeInputImageCI(createInfo);
+    vk::ExternalMemoryImageCreateInfo extMemImgCI {
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd,
+    };
+    imageCI.pNext = &extMemImgCI;
+
+    vk::Image image;
+    try {
+        image = ctx.dev.createImage(imageCI);
+    } catch (std::exception const& e) {
+        Info("Texture import probe: cannot create image: %s\n", e.what());
+        return false;
+    }
+
+    bool ok = false;
+    // Probe with a dup so the caller's fd stays usable for the real import.
+    int fd = dup(createInfo.inputImgFds[0]);
+    if (fd >= 0) {
+        try {
+            vk::MemoryRequirements2 memReqs {};
+            vk::ImageMemoryRequirementsInfo2 memReqInfo { .image = image };
+            ctx.dev.getImageMemoryRequirements2(&memReqInfo, &memReqs);
+
+            vk::ImportMemoryFdInfoKHR importMemInfo {
+                .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd,
+                .fd = fd,
+            };
+            vk::MemoryDedicatedAllocateInfo memDedicatedInfo {
+                .pNext = &importMemInfo,
+                .image = image,
+            };
+            vk::MemoryAllocateInfo memAllocInfo {
+                .pNext = &memDedicatedInfo,
+                .allocationSize = memReqs.memoryRequirements.size,
+                .memoryTypeIndex = memoryTypeIndex(
+                    ctx,
+                    vk::MemoryPropertyFlagBits::eDeviceLocal,
+                    memReqs.memoryRequirements.memoryTypeBits
+                ),
+            };
+            // On success Vulkan owns the fd and freeing the memory closes it.
+            auto memory = ctx.dev.allocateMemory(memAllocInfo);
+            ok = true;
+            ctx.dev.free(memory);
+        } catch (std::exception const& e) {
+            // A failed import leaves the fd with us.
+            close(fd);
+            Info("Texture import probe: import failed: %s\n", e.what());
+        }
+    }
+
+    ctx.dev.destroy(image);
+    return ok;
+}
+
+Renderer::Renderer(
+    VkContext const& vkCtx, RendererCreateInfo& createInfo, std::vector<PipelineCreateInfo> pipeCIs
+) {
+    eyeExtent = createInfo.inputEyeExtent;
+    outExtent = createInfo.outputExtent;
+
+    vk::Format unormFormat = unormFormatOf(createInfo.format);
+    vk::ImageCreateInfo inputImgCI = makeInputImageCI(createInfo);
 
     for (int i = 0; i < ImageCount; ++i) {
         inputImages[i] = createImage(vkCtx, inputImgCI, createInfo.inputImgFds[i], unormFormat);
@@ -793,11 +855,17 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
     // The fence wait below also orders the destruction of the temporary
     // imported semaphores: the queue waits on them until the submission
     // finishes, so destroying them earlier would be a use after free.
-    assert(vkCtx.dev.waitForFences(fence, true, UINT64_MAX) == vk::Result::eSuccess);
+    // Not inside assert(): with NDEBUG the wait itself would be compiled out
+    // and the encoder would read a frame the GPU has not finished.
+    auto waitResult = vkCtx.dev.waitForFences(fence, true, UINT64_MAX);
     vkCtx.dev.resetFences(fence);
 
     for (u32 i = 0; i < importedCount; ++i) {
         vkCtx.dev.destroy(importedSems[i]);
+    }
+
+    if (waitResult != vk::Result::eSuccess) {
+        throw std::runtime_error("render fence wait failed: " + vk::to_string(waitResult));
     }
 }
 

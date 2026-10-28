@@ -74,7 +74,65 @@ private:
     }
 
 public:
-    VkContext(std::vector<u8> deviceUUID) {
+    // Indices into vkEnumeratePhysicalDevices, best candidate first.
+    //
+    // The encoder has to run on the GPU that SteamVR renders on, or the swap
+    // textures cannot be imported and the headset gets no picture. Nothing
+    // tells us which one that is, so the caller tries these in order and keeps
+    // the first that can import the textures. On laptops the integrated GPU is
+    // usually listed first while SteamVR runs on the discrete one, so discrete
+    // GPUs go first. ALVR_VK_DEVICE_INDEX puts one device at the front.
+    static std::vector<u32> candidateDeviceIndices() {
+        vk::ApplicationInfo appInfo {
+            .pApplicationName = "ALVR",
+            .apiVersion = VK_API_VERSION_1_2,
+        };
+        auto instance = vk::createInstance({ .pApplicationInfo = &appInfo });
+        auto physDevs = instance.enumeratePhysicalDevices();
+
+        std::vector<u32> discrete, integrated, other;
+        for (u32 i = 0; i < physDevs.size(); ++i) {
+            auto props = physDevs[i].getProperties();
+            Info("Vulkan device %u: %s\n", i, props.deviceName.data());
+            switch (props.deviceType) {
+            case vk::PhysicalDeviceType::eDiscreteGpu:
+                discrete.push_back(i);
+                break;
+            case vk::PhysicalDeviceType::eIntegratedGpu:
+                integrated.push_back(i);
+                break;
+            case vk::PhysicalDeviceType::eCpu:
+                // llvmpipe and friends can neither import the textures nor encode.
+                break;
+            default:
+                other.push_back(i);
+                break;
+            }
+        }
+        auto deviceCount = static_cast<u32>(physDevs.size());
+        instance.destroy();
+
+        std::vector<u32> order;
+        if (auto env = getenv("ALVR_VK_DEVICE_INDEX")) {
+            char* end = nullptr;
+            auto idx = strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && idx < deviceCount) {
+                order.push_back(static_cast<u32>(idx));
+            } else {
+                Warn("Ignoring invalid ALVR_VK_DEVICE_INDEX=%s\n", env);
+            }
+        }
+        for (auto list : { &discrete, &integrated, &other }) {
+            for (auto idx : *list) {
+                if (std::find(order.begin(), order.end(), idx) == order.end()) {
+                    order.push_back(idx);
+                }
+            }
+        }
+        return order;
+    }
+
+    explicit VkContext(u32 physDevIndex) {
         std::vector<std::string_view> wantedInstExts = {
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
         };
@@ -102,28 +160,11 @@ public:
         };
         instance = vk::createInstance(instanceCI);
         auto physDevs = instance.enumeratePhysicalDevices();
-
-        physDev = physDevs[0];
-        //    for (auto dev : physDevs) {
-        //        vk::PhysicalDeviceVulkan11Properties props11{};
-        //        vk::PhysicalDeviceProperties2 props {
-        //            .pNext = &props11,
-        //        };
-        //        dev.getProperties2(&props);
-
-        // assert(deviceUUID.size() ==  VK_UUID_SIZE);
-        //        if (memcmp(props11.deviceUUID, deviceUUID.data(), VK_UUID_SIZE) == 0) {
-        //            physDev = dev;
-        //            break;
-        //        }
-        //    }
-        //    if (!physDev && !physDevs.empty()) {
-        //        Warn("Falling back to first physical device");
-        //        physDev = physDevs[0];
-        //    }
-        //    if (!physDev) {
-        //        throw std::runtime_error("Failed to find vulkan device");
-        //    }
+        if (physDevIndex >= physDevs.size()) {
+            instance.destroy();
+            throw std::runtime_error("Vulkan device index out of range");
+        }
+        physDev = physDevs[physDevIndex];
 
         auto queueFamilyProps = physDev.getQueueFamilyProperties();
 
