@@ -648,6 +648,18 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
                 "Could not set up the encoder: %s. Staying idle until the next client connect.\n",
                 e.what()
             );
+            std::string what = e.what();
+            if (what.find("OutOfDeviceMemory") != std::string::npos
+                || what.find("Cannot allocate memory") != std::string::npos
+                || what.find("CUDA device") != std::string::npos) {
+                Error(
+                    "The GPU is probably out of video memory. SteamVR renders at %ux%u per eye; "
+                    "lower the emulated headset resolution, the transcoding resolution or the "
+                    "SteamVR render resolution.\n",
+                    desc.nWidth,
+                    desc.nHeight
+                );
+            }
             enc.shutdown();
             layer0Texts.fill(0);
             m_encoderState = EncoderState::Idle;

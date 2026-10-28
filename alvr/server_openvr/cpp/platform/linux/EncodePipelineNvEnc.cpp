@@ -78,128 +78,136 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(
 )
     : v_ctx(v_ctx)
     , frame_ctx(vk_ctx.avCtx, input_frame.imageInfo()) {
-    // The surface format has to follow the output image's channel order. A
-    // mismatch still encodes successfully, with red and blue swapped.
-    auto input_frame_ctx = (AVHWFramesContext*)frame_ctx.ctx->data;
-    auto surface_format = nvenc_surface_format(input_frame_ctx->sw_format);
+    // A throw here skips the destructor, and a leaked CUDA context keeps a few
+    // hundred MB of VRAM, so each failed retry would leave less for the next.
+    try {
+        // The surface format has to follow the output image's channel order. A
+        // mismatch still encodes successfully, with red and blue swapped.
+        auto input_frame_ctx = (AVHWFramesContext*)frame_ctx.ctx->data;
+        auto surface_format = nvenc_surface_format(input_frame_ctx->sw_format);
 
-    int err;
-    vk_frame = input_frame.make_av_frame(frame_ctx);
+        int err;
+        vk_frame = input_frame.make_av_frame(frame_ctx);
 
-    err = av_hwdevice_ctx_create_derived(&hw_ctx, AV_HWDEVICE_TYPE_CUDA, vk_ctx.avCtx, 0);
-    if (err < 0) {
-        throw alvr::AvException("Failed to create a CUDA device:", err);
-    }
+        err = av_hwdevice_ctx_create_derived(&hw_ctx, AV_HWDEVICE_TYPE_CUDA, vk_ctx.avCtx, 0);
+        if (err < 0) {
+            throw alvr::AvException("Failed to create a CUDA device:", err);
+        }
 
-    const auto* settings = Settings_Instance();
+        const auto* settings = Settings_Instance();
 
-    auto codec_id = ALVR_CODEC(settings->m_codec);
-    const char* encoder_name = encoder(codec_id);
-    const AVCodec* codec = avcodec_find_encoder_by_name(encoder_name);
-    if (codec == nullptr) {
-        throw std::runtime_error(std::string("Failed to find encoder ") + encoder_name);
-    }
+        auto codec_id = ALVR_CODEC(settings->m_codec);
+        const char* encoder_name = encoder(codec_id);
+        const AVCodec* codec = avcodec_find_encoder_by_name(encoder_name);
+        if (codec == nullptr) {
+            throw std::runtime_error(std::string("Failed to find encoder ") + encoder_name);
+        }
 
-    encoder_ctx = avcodec_alloc_context3(codec);
-    if (not encoder_ctx) {
-        throw std::runtime_error("failed to allocate NvEnc encoder");
-    }
+        encoder_ctx = avcodec_alloc_context3(codec);
+        if (not encoder_ctx) {
+            throw std::runtime_error("failed to allocate NvEnc encoder");
+        }
 
-    switch (codec_id) {
-    case ALVR_CODEC_H264:
-        switch (settings->m_entropyCoding) {
-        case ALVR_CABAC:
-            av_opt_set(encoder_ctx->priv_data, "coder", "ac", 0);
+        switch (codec_id) {
+        case ALVR_CODEC_H264:
+            switch (settings->m_entropyCoding) {
+            case ALVR_CABAC:
+                av_opt_set(encoder_ctx->priv_data, "coder", "ac", 0);
+                break;
+            case ALVR_CAVLC:
+                av_opt_set(encoder_ctx->priv_data, "coder", "vlc", 0);
+                break;
+            }
             break;
-        case ALVR_CAVLC:
-            av_opt_set(encoder_ctx->priv_data, "coder", "vlc", 0);
+        case ALVR_CODEC_HEVC:
+            break;
+        case ALVR_CODEC_AV1:
             break;
         }
-        break;
-    case ALVR_CODEC_HEVC:
-        break;
-    case ALVR_CODEC_AV1:
-        break;
-    }
 
-    switch (settings->m_rateControlMode) {
-    case ALVR_CBR:
-        av_opt_set(encoder_ctx->priv_data, "rc", "cbr", 0);
-        break;
-    case ALVR_VBR:
-        av_opt_set(encoder_ctx->priv_data, "rc", "vbr", 0);
-        break;
-    }
-
-    if (codec_id == ALVR_CODEC_H264) {
-        switch (settings->m_h264Profile) {
-        case ALVR_H264_PROFILE_BASELINE:
-            av_opt_set(encoder_ctx->priv_data, "profile", "baseline", 0);
+        switch (settings->m_rateControlMode) {
+        case ALVR_CBR:
+            av_opt_set(encoder_ctx->priv_data, "rc", "cbr", 0);
             break;
-        case ALVR_H264_PROFILE_MAIN:
-            av_opt_set(encoder_ctx->priv_data, "profile", "main", 0);
-            break;
-        default:
-        case ALVR_H264_PROFILE_HIGH:
-            av_opt_set(encoder_ctx->priv_data, "profile", "high", 0);
+        case ALVR_VBR:
+            av_opt_set(encoder_ctx->priv_data, "rc", "vbr", 0);
             break;
         }
+
+        if (codec_id == ALVR_CODEC_H264) {
+            switch (settings->m_h264Profile) {
+            case ALVR_H264_PROFILE_BASELINE:
+                av_opt_set(encoder_ctx->priv_data, "profile", "baseline", 0);
+                break;
+            case ALVR_H264_PROFILE_MAIN:
+                av_opt_set(encoder_ctx->priv_data, "profile", "main", 0);
+                break;
+            default:
+            case ALVR_H264_PROFILE_HIGH:
+                av_opt_set(encoder_ctx->priv_data, "profile", "high", 0);
+                break;
+            }
+        }
+
+        char preset[] = "p0";
+        // replace 0 with preset number
+        preset[1] += settings->m_nvencQualityPreset;
+        av_opt_set(encoder_ctx->priv_data, "preset", preset, 0);
+
+        if (settings->m_nvencAdaptiveQuantizationMode == 1) {
+            av_opt_set_int(encoder_ctx->priv_data, "spatial_aq", 1, 0);
+        } else if (settings->m_nvencAdaptiveQuantizationMode == 2) {
+            av_opt_set_int(encoder_ctx->priv_data, "temporal_aq", 1, 0);
+        }
+
+        if (settings->m_nvencEnableWeightedPrediction) {
+            av_opt_set_int(encoder_ctx->priv_data, "weighted_pred", 1, 0);
+        }
+
+        av_opt_set_int(encoder_ctx->priv_data, "tune", settings->m_nvencTuningPreset, 0);
+        av_opt_set_int(encoder_ctx->priv_data, "zerolatency", 1, 0);
+        // Delay isn't actually a delay instead its how many surfaces to encode at a time
+        av_opt_set_int(encoder_ctx->priv_data, "delay", 1, 0);
+        av_opt_set_int(encoder_ctx->priv_data, "forced-idr", 1, 0);
+        // work around ffmpeg default not working for older NVIDIA cards
+        av_opt_set_int(encoder_ctx->priv_data, "b_ref_mode", 0, 0);
+
+        encoder_ctx->pix_fmt = AV_PIX_FMT_CUDA;
+        encoder_ctx->width = width;
+        encoder_ctx->height = height;
+        encoder_ctx->time_base = { 1, (int)1e9 };
+        encoder_ctx->framerate = AVRational { settings->m_refreshRate, 1 };
+        encoder_ctx->sample_aspect_ratio = AVRational { 1, 1 };
+        encoder_ctx->max_b_frames = 0;
+        encoder_ctx->gop_size = INT16_MAX;
+        encoder_ctx->color_range = AVCOL_RANGE_JPEG;
+        encoder_ctx->color_primaries = AVCOL_PRI_BT709;
+        encoder_ctx->color_trc = AVCOL_TRC_IEC61966_2_1;
+        encoder_ctx->colorspace = AVCOL_SPC_BT709;
+        // The manager reports a target only once per change, so a rebuild mid
+        // session has to reuse the last one.
+        auto params = GetDynamicEncoderParams();
+        if (!params.updated || params.bitrate_bps <= 0) {
+            params.bitrate_bps = last_known_bitrate_bps > 0 ? last_known_bitrate_bps : 30'000'000;
+        }
+        params.updated = true;
+        params.framerate = settings->m_refreshRate;
+        Info("NvEnc init bitrate: %.1f Mbps\n", params.bitrate_bps / 1e6);
+        SetParams(params);
+
+        set_hwframe_ctx(encoder_ctx, hw_ctx, surface_format);
+
+        err = avcodec_open2(encoder_ctx, codec, NULL);
+        if (err < 0) {
+            throw alvr::AvException("Cannot open video encoder codec:", err);
+        }
+
+        hw_frame = av_frame_alloc();
+    } catch (...) {
+        av_buffer_unref(&hw_ctx);
+        av_frame_free(&hw_frame);
+        throw;
     }
-
-    char preset[] = "p0";
-    // replace 0 with preset number
-    preset[1] += settings->m_nvencQualityPreset;
-    av_opt_set(encoder_ctx->priv_data, "preset", preset, 0);
-
-    if (settings->m_nvencAdaptiveQuantizationMode == 1) {
-        av_opt_set_int(encoder_ctx->priv_data, "spatial_aq", 1, 0);
-    } else if (settings->m_nvencAdaptiveQuantizationMode == 2) {
-        av_opt_set_int(encoder_ctx->priv_data, "temporal_aq", 1, 0);
-    }
-
-    if (settings->m_nvencEnableWeightedPrediction) {
-        av_opt_set_int(encoder_ctx->priv_data, "weighted_pred", 1, 0);
-    }
-
-    av_opt_set_int(encoder_ctx->priv_data, "tune", settings->m_nvencTuningPreset, 0);
-    av_opt_set_int(encoder_ctx->priv_data, "zerolatency", 1, 0);
-    // Delay isn't actually a delay instead its how many surfaces to encode at a time
-    av_opt_set_int(encoder_ctx->priv_data, "delay", 1, 0);
-    av_opt_set_int(encoder_ctx->priv_data, "forced-idr", 1, 0);
-    // work around ffmpeg default not working for older NVIDIA cards
-    av_opt_set_int(encoder_ctx->priv_data, "b_ref_mode", 0, 0);
-
-    encoder_ctx->pix_fmt = AV_PIX_FMT_CUDA;
-    encoder_ctx->width = width;
-    encoder_ctx->height = height;
-    encoder_ctx->time_base = { 1, (int)1e9 };
-    encoder_ctx->framerate = AVRational { settings->m_refreshRate, 1 };
-    encoder_ctx->sample_aspect_ratio = AVRational { 1, 1 };
-    encoder_ctx->max_b_frames = 0;
-    encoder_ctx->gop_size = INT16_MAX;
-    encoder_ctx->color_range = AVCOL_RANGE_JPEG;
-    encoder_ctx->color_primaries = AVCOL_PRI_BT709;
-    encoder_ctx->color_trc = AVCOL_TRC_IEC61966_2_1;
-    encoder_ctx->colorspace = AVCOL_SPC_BT709;
-    // The manager reports a target only once per change, so a rebuild mid
-    // session has to reuse the last one.
-    auto params = GetDynamicEncoderParams();
-    if (!params.updated || params.bitrate_bps <= 0) {
-        params.bitrate_bps = last_known_bitrate_bps > 0 ? last_known_bitrate_bps : 30'000'000;
-    }
-    params.updated = true;
-    params.framerate = settings->m_refreshRate;
-    Info("NvEnc init bitrate: %.1f Mbps\n", params.bitrate_bps / 1e6);
-    SetParams(params);
-
-    set_hwframe_ctx(encoder_ctx, hw_ctx, surface_format);
-
-    err = avcodec_open2(encoder_ctx, codec, NULL);
-    if (err < 0) {
-        throw alvr::AvException("Cannot open video encoder codec:", err);
-    }
-
-    hw_frame = av_frame_alloc();
 }
 
 alvr::EncodePipelineNvEnc::~EncodePipelineNvEnc() {
