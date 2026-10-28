@@ -641,8 +641,23 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
         m_encGeneration++;
 
         try {
-            enc.createImages(rendererCI);
-            enc.initEncoding();
+            bool replaced = false;
+            try {
+                replaced = enc.tryReplaceInputs(rendererCI);
+            } catch (std::exception const& e) {
+                // The fds may be partly consumed; dup fresh ones for the full rebuild.
+                Warn("Swapping in new textures failed (%s), rebuilding the encoder\n", e.what());
+                for (u32 i = 0; i < 3; ++i) {
+                    rendererCI.inputImgFds[i] = dup(leftIt->second.first->fds[i]);
+                    rendererCI.inputImgFds[i + 3] = dup(rightIt->second.first->fds[i]);
+                }
+            }
+            if (replaced) {
+                Info("Swapped in new %ux%u textures, encoder kept\n", desc.nWidth, desc.nHeight);
+            } else {
+                enc.createImages(rendererCI);
+                enc.initEncoding();
+            }
         } catch (std::exception const& e) {
             Error(
                 "Could not set up the encoder: %s. Staying idle until the next client connect.\n",

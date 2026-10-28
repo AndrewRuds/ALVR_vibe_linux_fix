@@ -115,6 +115,9 @@ class Encoder {
     // unwarped, which is worse than not warping at all.
     bool warpCapableChain = false;
 
+    // Format of the swap textures the renderer was built for.
+    vk::Format inputFormat = vk::Format::eUndefined;
+
     VkContext& ctx() { return vkCtxOpt.get(); }
 
     void destroyContext() {
@@ -212,7 +215,35 @@ public:
         }
 
         outExtent = rendererCI.outputExtent;
+        inputFormat = rendererCI.format;
         renderer.emplace(vkCtx, rendererCI, pipeCIs);
+    }
+
+    // Games and SteamVR recreate their swap textures whenever they change
+    // render resolution, some every few seconds. Rebuilding the encoder for
+    // each costs a stall, a new CUDA/NvEnc session and a full keyframe, which
+    // can choke a USB (adb) link long enough for the connection to time out.
+    // Swap only the inputs when that is enough. Returns false when a full
+    // createImages + initEncoding is needed.
+    bool tryReplaceInputs(render::RendererCreateInfo rendererCI) {
+        if (!encoder || !renderer.hasValue() || !vkCtxOpt.hasValue()) {
+            return false;
+        }
+        // The colour pass bakes the input size into specialization constants.
+        if (Settings_Instance()->m_enableColorCorrection) {
+            return false;
+        }
+        // The output image, and the encoder's surface format, follow this.
+        if (render::unormFormatOf(rendererCI.format) != render::unormFormatOf(inputFormat)) {
+            return false;
+        }
+        if (!render::canImportInputImages(ctx(), rendererCI)) {
+            return false;
+        }
+
+        renderer.get().replaceInputs(ctx(), rendererCI);
+        inputFormat = rendererCI.format;
+        return true;
     }
 
     void initEncoding() {

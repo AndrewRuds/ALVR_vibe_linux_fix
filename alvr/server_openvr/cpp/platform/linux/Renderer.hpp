@@ -67,6 +67,16 @@ struct RendererCreateInfo {
     std::array<int, ImageCount> inputImgFds;
 };
 
+// UNORM twin of an sRGB swap texture format; other formats map to themselves.
+// Everything after the input copy, the output image included, uses this.
+inline vk::Format unormFormatOf(vk::Format format) {
+    if (format == vk::Format::eR8G8B8A8Srgb)
+        return vk::Format::eR8G8B8A8Unorm;
+    if (format == vk::Format::eB8G8R8A8Srgb)
+        return vk::Format::eB8G8R8A8Unorm;
+    return format;
+}
+
 // True when this device can import SteamVR's swap textures, i.e. it is the GPU
 // SteamVR renders on. Leaves createInfo.inputImgFds untouched.
 bool canImportInputImages(VkContext const& ctx, RendererCreateInfo const& createInfo);
@@ -150,12 +160,20 @@ class Renderer {
 
     // vk::Semaphore renderFinishedSem;
 
+    void createInputs(VkContext const& vkCtx, RendererCreateInfo& createInfo);
+
 public:
     Renderer(
         VkContext const& vkCtx,
         RendererCreateInfo& createInfo,
         std::vector<PipelineCreateInfo> pipeCIs
     );
+
+    // Swaps in a new set of SteamVR swap textures, keeping the pipelines and
+    // the output image, so the encoder reading that image can stay as is.
+    // Only valid when the pass chain does not depend on the input size and
+    // unormFormatOf(format) is unchanged. Takes ownership of the fds.
+    void replaceInputs(VkContext const& ctx, RendererCreateInfo& createInfo);
 
     // TODO: Import output (somehow?)
 

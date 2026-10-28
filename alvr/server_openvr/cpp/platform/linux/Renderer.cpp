@@ -438,15 +438,6 @@ Output createOutputImage(
     return out;
 }
 
-// UNORM twin of an sRGB swap texture format; other formats map to themselves.
-static vk::Format unormFormatOf(vk::Format format) {
-    if (format == vk::Format::eR8G8B8A8Srgb)
-        return vk::Format::eR8G8B8A8Unorm;
-    if (format == vk::Format::eB8G8R8A8Srgb)
-        return vk::Format::eB8G8R8A8Unorm;
-    return format;
-}
-
 // The import must match how SteamVR created the image: its real format
 // and MUTABLE_FORMAT (passed in CreateSwapTextureSet), and no format list
 // since SteamVR's image has none. A list could let the driver choose a
@@ -536,36 +527,16 @@ bool canImportInputImages(VkContext const& ctx, RendererCreateInfo const& create
 Renderer::Renderer(
     VkContext const& vkCtx, RendererCreateInfo& createInfo, std::vector<PipelineCreateInfo> pipeCIs
 ) {
-    eyeExtent = createInfo.inputEyeExtent;
     outExtent = createInfo.outputExtent;
 
-    vk::Format unormFormat = unormFormatOf(createInfo.format);
-    vk::ImageCreateInfo inputImgCI = makeInputImageCI(createInfo);
-
-    for (int i = 0; i < ImageCount; ++i) {
-        inputImages[i] = createImage(vkCtx, inputImgCI, createInfo.inputImgFds[i], unormFormat);
-    }
-
-    // Everything downstream is UNORM regardless of the input format: the
-    // copy moves raw bytes, the shaders imageStore through rgba8, and the
-    // encoder consumes raw bytes with no notion of sRGB.
-    auto stagingImgCI = inputImgCI;
-    stagingImgCI.flags = {};
-    stagingImgCI.format = unormFormat;
-    stagingImgCI.extent.width = eyeExtent.width * 2;
-    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst
-        | vk::ImageUsageFlagBits::eStorage;
-
-    for (auto& img : stagingImgs) {
-        img = createImage(vkCtx, stagingImgCI);
-    }
+    createInputs(vkCtx, createInfo);
 
     // VAAPI imports through DRM-PRIME and wants a dma-buf; NvEnc imports
     // through CUDA interop and wants an opaque fd.
     output = createOutputImage(
         vkCtx,
         createInfo.outputExtent,
-        stagingImgCI.format,
+        unormFormatOf(createInfo.format),
         vkCtx.meta.vendor == Vendor::Nvidia ? HandleType::OpaqueFd : HandleType::DmaBuf
     );
 
@@ -867,6 +838,48 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
     if (waitResult != vk::Result::eSuccess) {
         throw std::runtime_error("render fence wait failed: " + vk::to_string(waitResult));
     }
+}
+
+void Renderer::createInputs(VkContext const& vkCtx, RendererCreateInfo& createInfo) {
+    eyeExtent = createInfo.inputEyeExtent;
+
+    vk::Format unormFormat = unormFormatOf(createInfo.format);
+    vk::ImageCreateInfo inputImgCI = makeInputImageCI(createInfo);
+
+    for (u32 i = 0; i < ImageCount; ++i) {
+        inputImages[i] = createImage(vkCtx, inputImgCI, createInfo.inputImgFds[i], unormFormat);
+    }
+
+    // Everything downstream is UNORM regardless of the input format: the
+    // copy moves raw bytes, the shaders imageStore through rgba8, and the
+    // encoder consumes raw bytes with no notion of sRGB.
+    auto stagingImgCI = inputImgCI;
+    stagingImgCI.flags = {};
+    stagingImgCI.format = unormFormat;
+    stagingImgCI.extent.width = eyeExtent.width * 2;
+    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst
+        | vk::ImageUsageFlagBits::eStorage;
+
+    for (auto& img : stagingImgs) {
+        img = createImage(vkCtx, stagingImgCI);
+    }
+}
+
+void Renderer::replaceInputs(VkContext const& ctx, RendererCreateInfo& createInfo) {
+    // render() waits for its fence and the encoder copy is synchronous, but
+    // be certain nothing still reads the images being dropped.
+    ctx.dev.waitIdle();
+
+    for (auto& img : inputImages) {
+        img.destroy(ctx);
+        img = {};
+    }
+    for (auto& img : stagingImgs) {
+        img.destroy(ctx);
+        img = {};
+    }
+
+    createInputs(ctx, createInfo);
 }
 
 void Renderer::destroy(VkContext const& ctx) {
