@@ -229,10 +229,16 @@ fn main() {
         .unwrap();
 
     if platform_name == "linux" {
+        // A build script's cfg! describes the host, so read the target from cargo.
+        let openvr_lib_dir = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+            Ok("aarch64") => "linuxarm64",
+            _ => "linux64",
+        };
         println!(
             "cargo:rustc-link-search=native={}",
             alvr_filesystem::workspace_dir()
-                .join("openvr/lib/linux64")
+                .join("openvr/lib")
+                .join(openvr_lib_dir)
                 .to_string_lossy()
         );
         println!("cargo:rustc-link-lib=openvr_api");

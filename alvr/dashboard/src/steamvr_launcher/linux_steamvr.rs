@@ -25,9 +25,14 @@ pub fn terminate_process(process: &Process) {
 // SteamVR finds no HMD and fails with errors like 108. Undo it on every
 // launch so a stale wrap from a previous install cannot break this one.
 pub fn maybe_unwrap_vrcompositor_launcher() -> Result<()> {
-    let steamvr_bin_dir = alvr_server_io::steamvr_root_dir()?
-        .join("bin")
-        .join("linux64");
+    let steamvr_bin_dir =
+        alvr_server_io::steamvr_root_dir()?
+            .join("bin")
+            .join(if cfg!(target_arch = "aarch64") {
+                "linuxarm64"
+            } else {
+                "linux64"
+            });
     let launcher_path = steamvr_bin_dir.join("vrcompositor");
 
     // Not a symlink means nothing wrapped it, so there is nothing to undo.

@@ -235,6 +235,9 @@ impl Layout {
     pub fn openvr_driver_lib_dir(&self) -> PathBuf {
         let platform = if cfg!(windows) {
             "win64"
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            // SteamVR's folder name for ARM64 Linux drivers.
+            "linuxarm64"
         } else if cfg!(target_os = "linux") {
             "linux64"
         } else if cfg!(target_os = "macos") {
