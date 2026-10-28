@@ -250,7 +250,9 @@ Output createOutputImage(
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
-        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+        // TransferSrc lets the software encoder copy it to host memory.
+        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled
+            | vk::ImageUsageFlagBits::eTransferSrc,
         .sharingMode = vk::SharingMode::eExclusive,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
@@ -532,12 +534,15 @@ Renderer::Renderer(
     createInputs(vkCtx, createInfo);
 
     // VAAPI imports through DRM-PRIME and wants a dma-buf; NvEnc imports
-    // through CUDA interop and wants an opaque fd.
+    // through CUDA interop and wants an opaque fd. The software encoder,
+    // used on other GPUs, only copies it to host memory and needs no export.
     output = createOutputImage(
         vkCtx,
         createInfo.outputExtent,
         unormFormatOf(createInfo.format),
-        vkCtx.meta.vendor == Vendor::Nvidia ? HandleType::OpaqueFd : HandleType::DmaBuf
+        vkCtx.meta.vendor == Vendor::Nvidia      ? HandleType::OpaqueFd
+            : vkCtx.meta.vendor == Vendor::Other ? HandleType::None
+                                                 : HandleType::DmaBuf
     );
 
     vk::QueryPoolCreateInfo poolCI {

@@ -34,7 +34,9 @@ extern "C" {
 
 namespace alvr {
 
-enum class Vendor { Amd, Intel, Nvidia };
+// Other covers GPUs without a supported hardware encoder, such as Apple
+// Silicon on Asahi Linux; they use the software encoder.
+enum class Vendor { Amd, Intel, Nvidia, Other };
 
 class VkContext {
 public:
@@ -45,7 +47,7 @@ public:
     vk::detail::DispatchLoaderDynamic dispatch;
 
     struct Meta {
-        Vendor vendor;
+        Vendor vendor = Vendor::Other;
 
         std::vector<char const*> instExtensions;
         std::vector<char const*> devExtensions;
@@ -69,6 +71,8 @@ private:
             meta.vendor = Vendor::Intel;
         else if (devProps.properties.vendorID == 0x10de)
             meta.vendor = Vendor::Nvidia;
+        else
+            meta.vendor = Vendor::Other;
 
         dispatch = { instance, vkGetInstanceProcAddr };
     }

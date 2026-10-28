@@ -1,10 +1,10 @@
 #include "EncodePipeline.h"
 
+#include "EncodePipelineNvEnc.h"
+#include "EncodePipelineSW.h"
+#include "EncodePipelineVAAPI.h"
 #include "alvr_server/Logger.h"
 #include "alvr_server/bindings.h"
-// #include "EncodePipelineSW.h"
-#include "EncodePipelineNvEnc.h"
-#include "EncodePipelineVAAPI.h"
 #include "ffmpeg_helper.h"
 
 extern "C" {
@@ -30,10 +30,11 @@ std::unique_ptr<alvr::EncodePipeline> alvr::EncodePipeline::Create(
     uint32_t height
 ) {
     using alvr::Vendor;
+    auto const vendor = vk_ctx.meta.vendor;
     if (Settings_Instance()->m_forceSwEncoding == false) {
-        alvr::HWContext hwCtx(vk_ctx);
-        if (vk_ctx.meta.vendor == Vendor::Nvidia) {
+        if (vendor == Vendor::Nvidia) {
             try {
+                alvr::HWContext hwCtx(vk_ctx);
                 auto nvenc = std::make_unique<alvr::EncodePipelineNvEnc>(
                     hwCtx, vk_ctx, input_frame, width, height
                 );
@@ -46,10 +47,11 @@ std::unique_ptr<alvr::EncodePipeline> alvr::EncodePipeline::Create(
                     e.what()
                 );
             }
-        } else {
+        } else if (vendor == Vendor::Amd || vendor == Vendor::Intel) {
             try {
+                alvr::HWContext hwCtx(vk_ctx);
                 auto vaapi = std::make_unique<alvr::EncodePipelineVAAPI>(
-                    hwCtx, devicePath, vk_ctx.meta.vendor, input_frame, width, height
+                    hwCtx, devicePath, vendor, input_frame, width, height
                 );
                 Info("Using VAAPI encoder");
                 return vaapi;
@@ -60,11 +62,21 @@ std::unique_ptr<alvr::EncodePipeline> alvr::EncodePipeline::Create(
                     e.what()
                 );
             }
+        } else {
+            Info("No hardware encoder is supported for this GPU, using the software encoder");
         }
     }
-    // auto sw = std::make_unique<alvr::EncodePipelineSW>(render, width, height);
-    // Info("Using SW encoder");
-    // return sw;
+
+    // Software fallback. Slow and CPU heavy, but works on any GPU.
+    try {
+        auto sw = std::make_unique<alvr::EncodePipelineSW>(
+            vk_ctx, input_frame.image(), vk::Format(input_frame.format()), width, height
+        );
+        Info("Using software (x264) encoder");
+        return sw;
+    } catch (std::exception& e) {
+        Error("Failed to create software encoder: %s", e.what());
+    }
     return nullptr;
 }
 
