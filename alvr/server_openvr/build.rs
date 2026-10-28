@@ -105,6 +105,14 @@ fn main() {
         build.include(vulkan_headers);
 
         build.include(ffmpeg_path.join("include"));
+
+        // Installed by prepare-deps unless --no-nvidia was passed. The NvEnc
+        // pipeline uses it to import frames into CUDA itself.
+        let nv_codec_headers =
+            alvr_filesystem::deps_dir().join("linux/nv-codec-headers/build/include");
+        if platform_name == "linux" && nv_codec_headers.exists() {
+            build.include(nv_codec_headers);
+        }
     }
 
     if platform_name == "linux" {

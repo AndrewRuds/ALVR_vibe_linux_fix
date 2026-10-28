@@ -6,6 +6,11 @@
 #include <functional>
 #include <memory>
 
+#if __has_include(<ffnvcodec/dynlink_loader.h>)
+#define ALVR_HAVE_CUDA_INTEROP
+#include <ffnvcodec/dynlink_loader.h>
+#endif
+
 extern "C" struct AVBufferRef;
 extern "C" struct AVCodecContext;
 extern "C" struct AVFrame;
@@ -30,5 +35,17 @@ private:
     AVBufferRef* hw_ctx = nullptr;
     std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> vk_frame;
     AVFrame* hw_frame = nullptr;
+
+#ifdef ALVR_HAVE_CUDA_INTEROP
+    void importOutputToCuda(VkFrame& input_frame);
+    void releaseCuda();
+
+    CudaFunctions* cu = nullptr;
+    CUexternalMemory cuExtMem = nullptr;
+    CUmipmappedArray cuMipArray = nullptr;
+    CUarray cuArray = nullptr;
+    size_t copyWidthBytes = 0;
+    size_t copyHeight = 0;
+#endif
 };
 }

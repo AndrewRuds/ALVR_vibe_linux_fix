@@ -11,6 +11,17 @@ extern "C" {
 #include <libavutil/opt.h>
 }
 
+#ifdef ALVR_HAVE_CUDA_INTEROP
+#include <unistd.h>
+extern "C" {
+#include <libavutil/hwcontext_cuda.h>
+}
+// Not in the nv-codec-headers copy of the CUDA API.
+#ifndef CUDA_EXTERNAL_MEMORY_DEDICATED
+#define CUDA_EXTERNAL_MEMORY_DEDICATED 0x1
+#endif
+#endif
+
 namespace {
 
 const char* encoder(ALVR_CODEC codec) {
@@ -93,6 +104,10 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(
         if (err < 0) {
             throw alvr::AvException("Failed to create a CUDA device:", err);
         }
+
+#ifdef ALVR_HAVE_CUDA_INTEROP
+        importOutputToCuda(input_frame);
+#endif
 
         const auto* settings = Settings_Instance();
 
@@ -204,6 +219,9 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(
 
         hw_frame = av_frame_alloc();
     } catch (...) {
+#ifdef ALVR_HAVE_CUDA_INTEROP
+        releaseCuda();
+#endif
         av_buffer_unref(&hw_ctx);
         av_frame_free(&hw_frame);
         throw;
@@ -211,9 +229,111 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(
 }
 
 alvr::EncodePipelineNvEnc::~EncodePipelineNvEnc() {
+#ifdef ALVR_HAVE_CUDA_INTEROP
+    releaseCuda();
+#endif
     av_buffer_unref(&hw_ctx);
     av_frame_free(&hw_frame);
 }
+
+#ifdef ALVR_HAVE_CUDA_INTEROP
+// ffmpeg's own Vulkan to CUDA transfer is not used: it attaches the CUDA
+// import, and a reference to the whole CUDA device and frame pool, to the
+// AVVkFrame, and only frees that for frames ffmpeg allocated itself. Ours are
+// not, so every encoder rebuild leaked hundreds of MB of VRAM until the next
+// one failed with out of memory. It also describes an RGBA image to CUDA as a
+// one channel array and drops the dedicated allocation flag. Importing here
+// keeps the lifetime with this pipeline.
+namespace {
+void checkCu(CudaFunctions* cu, CUresult res, char const* what) {
+    if (res == CUDA_SUCCESS) {
+        return;
+    }
+    char const* name = nullptr;
+    cu->cuGetErrorName(res, &name);
+    throw std::runtime_error(std::string(what) + " failed: " + (name ? name : "unknown error"));
+}
+}
+
+void alvr::EncodePipelineNvEnc::importOutputToCuda(VkFrame& input_frame) {
+    if (cuda_load_functions(&cu, nullptr) < 0 || !cu->cuImportExternalMemory) {
+        throw std::runtime_error("Failed to load the CUDA driver library (libcuda.so.1)");
+    }
+    auto* cudaDev = (AVCUDADeviceContext*)((AVHWDeviceContext*)hw_ctx->data)->hwctx;
+
+    AVVkFrame* vkf = input_frame;
+    auto info = input_frame.imageInfo();
+    copyWidthBytes = size_t(info.extent.width) * 4;
+    copyHeight = info.extent.height;
+
+    vk::MemoryGetFdInfoKHR fdInfo {
+        .memory = vkf->mem[0],
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd,
+    };
+    int fd = v_ctx.dev.getMemoryFdKHR(fdInfo, v_ctx.dispatch);
+
+    checkCu(cu, cu->cuCtxPushCurrent(cudaDev->cuda_ctx), "cuCtxPushCurrent");
+    try {
+        CUDA_EXTERNAL_MEMORY_HANDLE_DESC memDesc = {};
+        memDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+        memDesc.handle.fd = fd;
+        memDesc.size = vkf->size[0];
+        // The renderer allocates the output image as a dedicated allocation.
+        memDesc.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
+        CUresult res = cu->cuImportExternalMemory(&cuExtMem, &memDesc);
+        if (res != CUDA_SUCCESS) {
+            // CUDA only takes the fd on success.
+            close(fd);
+            checkCu(cu, res, "cuImportExternalMemory");
+        }
+
+        CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC arrDesc = {};
+        arrDesc.arrayDesc.Width = info.extent.width;
+        arrDesc.arrayDesc.Height = info.extent.height;
+        arrDesc.arrayDesc.Depth = 0;
+        arrDesc.arrayDesc.Format = CU_AD_FORMAT_UNSIGNED_INT8;
+        arrDesc.arrayDesc.NumChannels = 4;
+        arrDesc.numLevels = 1;
+        checkCu(
+            cu,
+            cu->cuExternalMemoryGetMappedMipmappedArray(&cuMipArray, cuExtMem, &arrDesc),
+            "cuExternalMemoryGetMappedMipmappedArray"
+        );
+        checkCu(
+            cu, cu->cuMipmappedArrayGetLevel(&cuArray, cuMipArray, 0), "cuMipmappedArrayGetLevel"
+        );
+    } catch (...) {
+        CUcontext dummy;
+        cu->cuCtxPopCurrent(&dummy);
+        throw;
+    }
+    CUcontext dummy;
+    cu->cuCtxPopCurrent(&dummy);
+}
+
+void alvr::EncodePipelineNvEnc::releaseCuda() {
+    if (!cu) {
+        return;
+    }
+    if (hw_ctx && (cuMipArray || cuExtMem)) {
+        auto* cudaDev = (AVCUDADeviceContext*)((AVHWDeviceContext*)hw_ctx->data)->hwctx;
+        if (cu->cuCtxPushCurrent(cudaDev->cuda_ctx) == CUDA_SUCCESS) {
+            if (cuMipArray) {
+                cu->cuMipmappedArrayDestroy(cuMipArray);
+            }
+            if (cuExtMem) {
+                cu->cuDestroyExternalMemory(cuExtMem);
+            }
+            CUcontext dummy;
+            cu->cuCtxPopCurrent(&dummy);
+        }
+    }
+    cuMipArray = nullptr;
+    cuArray = nullptr;
+    cuExtMem = nullptr;
+    cuda_free_functions(&cu);
+}
+#endif
 
 void alvr::EncodePipelineNvEnc::SetParams(FfiDynamicEncoderParams params) {
     if (!params.updated) {
@@ -229,6 +349,49 @@ void alvr::EncodePipelineNvEnc::SetParams(FfiDynamicEncoderParams params) {
 }
 
 void alvr::EncodePipelineNvEnc::PushFrame(uint64_t targetTimestampNs, bool idr) {
+#ifdef ALVR_HAVE_CUDA_INTEROP
+    {
+        int err = av_hwframe_get_buffer(encoder_ctx->hw_frames_ctx, hw_frame, 0);
+        if (err < 0) {
+            throw alvr::AvException("Failed to allocate CUDA frame", err);
+        }
+        auto* cudaDev = (AVCUDADeviceContext*)((AVHWDeviceContext*)hw_ctx->data)->hwctx;
+
+        // The renderer has already waited for its fence, so the image is
+        // complete. Waiting for the copy keeps the next render from
+        // overwriting it while CUDA still reads.
+        CUDA_MEMCPY2D cpy = {};
+        cpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+        cpy.srcArray = cuArray;
+        cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpy.dstDevice = (CUdeviceptr)hw_frame->data[0];
+        cpy.dstPitch = hw_frame->linesize[0];
+        cpy.WidthInBytes = copyWidthBytes;
+        cpy.Height = copyHeight;
+
+        checkCu(cu, cu->cuCtxPushCurrent(cudaDev->cuda_ctx), "cuCtxPushCurrent");
+        CUresult res = cu->cuMemcpy2DAsync(&cpy, cudaDev->stream);
+        if (res == CUDA_SUCCESS) {
+            res = cu->cuStreamSynchronize(cudaDev->stream);
+        }
+        CUcontext dummy;
+        cu->cuCtxPopCurrent(&dummy);
+        if (res != CUDA_SUCCESS) {
+            av_frame_unref(hw_frame);
+            checkCu(cu, res, "copy of the frame to CUDA");
+        }
+
+        hw_frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+        hw_frame->pts = targetTimestampNs;
+
+        err = avcodec_send_frame(encoder_ctx, hw_frame);
+        av_frame_unref(hw_frame);
+        if (err < 0) {
+            throw alvr::AvException("avcodec_send_frame failed:", err);
+        }
+        return;
+    }
+#endif
     AVVkFrame* vkf = reinterpret_cast<AVVkFrame*>(vk_frame->data[0]);
     vkf->sem_value[0]++;
 
