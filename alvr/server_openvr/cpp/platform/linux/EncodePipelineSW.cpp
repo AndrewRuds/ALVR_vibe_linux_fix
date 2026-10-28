@@ -5,8 +5,10 @@
 #include "alvr_server/bindings.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <ctime>
 #include <stdexcept>
 #include <thread>
 
@@ -361,9 +363,61 @@ void alvr::EncodePipelineSW::convertToI420() {
     }
 }
 
+namespace {
+double cpuSeconds() {
+    timespec ts {};
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+}
+}
+
+void alvr::EncodePipelineSW::reportStats(double readbackMs, double convertMs, double encodeMs) {
+    using Clock = std::chrono::steady_clock;
+    stats.frames++;
+    stats.readbackMs += readbackMs;
+    stats.convertMs += convertMs;
+    stats.encodeMs += encodeMs;
+    stats.bytes += uint64_t(std::max(nalSize, 0));
+
+    auto now = Clock::now();
+    if (stats.frames == 1 && stats.windowStartCpu == 0.0) {
+        stats.windowStart = now;
+        stats.windowStartCpu = cpuSeconds();
+        return;
+    }
+    double wall = std::chrono::duration<double>(now - stats.windowStart).count();
+    if (wall < 5.0) {
+        return;
+    }
+    double cpu = cpuSeconds() - stats.windowStartCpu;
+    double n = double(stats.frames);
+    // CPU % is for the whole vrserver process, where 100% is one core.
+    Info(
+        "Software encoder: %.1f fps, per frame readback %.2f ms, convert %.2f ms, x264 %.2f ms, "
+        "total %.2f ms, %.0f KB/frame, vrserver CPU %.0f%% of one core\n",
+        n / wall,
+        stats.readbackMs / n,
+        stats.convertMs / n,
+        stats.encodeMs / n,
+        (stats.readbackMs + stats.convertMs + stats.encodeMs) / n,
+        double(stats.bytes) / n / 1024.0,
+        cpu / wall * 100.0
+    );
+    stats = {};
+    stats.windowStart = now;
+    stats.windowStartCpu = cpuSeconds();
+}
+
 void alvr::EncodePipelineSW::PushFrame(uint64_t targetTimestampNs, bool idr) {
+    using Clock = std::chrono::steady_clock;
+    auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = Clock::now();
     readback();
+    auto t1 = Clock::now();
     convertToI420();
+    auto t2 = Clock::now();
 
     picture.i_type = idr ? X264_TYPE_IDR : X264_TYPE_AUTO;
     picture.i_pts = int64_t(targetTimestampNs);
@@ -378,6 +432,7 @@ void alvr::EncodePipelineSW::PushFrame(uint64_t targetTimestampNs, bool idr) {
     if (nalCount == 0) {
         nalSize = 0;
     }
+    reportStats(ms(t0, t1), ms(t1, t2), ms(t2, Clock::now()));
 }
 
 bool alvr::EncodePipelineSW::GetEncoded(FramePacket& packet) {

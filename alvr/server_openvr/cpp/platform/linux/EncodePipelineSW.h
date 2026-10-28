@@ -3,6 +3,7 @@
 #include "EncodePipeline.h"
 #include "VkContext.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -36,6 +37,15 @@ private:
     void release();
     void readback();
     void convertToI420();
+    void reportStats(double readbackMs, double convertMs, double encodeMs);
+
+    struct Stats {
+        uint64_t frames = 0;
+        double readbackMs = 0, convertMs = 0, encodeMs = 0;
+        uint64_t bytes = 0;
+        std::chrono::steady_clock::time_point windowStart {};
+        double windowStartCpu = 0.0;
+    } stats;
 
     VkContext& vk_ctx;
     vk::Image outputImage;
