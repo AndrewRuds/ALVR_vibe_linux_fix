@@ -57,6 +57,12 @@ public:
 
         u32 queueFamily;
         u32 queueIndex;
+
+        // Optional capabilities; not every driver (Asahi's Honeykrisp, for
+        // one) has all of them.
+        bool samplerAnisotropy = false;
+        float maxSamplerAnisotropy = 1.f;
+        bool timestamps = false;
     } meta;
 
 private:
@@ -185,6 +191,7 @@ public:
         }
         meta.queueFamily = wantedQueueFamily.value();
         meta.queueIndex = 0;
+        meta.timestamps = queueFamilyProps[meta.queueFamily].timestampValidBits > 0;
 
         std::vector<std::string_view> wantedExts = {
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
@@ -211,6 +218,28 @@ public:
                 acquiredExts.push_back(name.data());
         }
 
+        // Without these the renderer cannot import SteamVR's textures or bind
+        // its descriptors. Fail here with a clear message instead of crashing
+        // on a null function pointer later.
+        for (std::string_view required : {
+                 VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                 VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+                 VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+             }) {
+            if (std::none_of(acquiredExts.begin(), acquiredExts.end(), [&](char const* name) {
+                    return required == name;
+                })) {
+                instance.destroy();
+                throw std::runtime_error(
+                    std::string("Vulkan device lacks required extension ") + required.data()
+                );
+            }
+        }
+
+        auto supported = physDev.getFeatures();
+        meta.samplerAnisotropy = supported.samplerAnisotropy;
+        meta.maxSamplerAnisotropy = physDev.getProperties().limits.maxSamplerAnisotropy;
+
         f32 queuePrio = 1.f;
         vk::DeviceQueueCreateInfo queueCI {
             .queueFamilyIndex = meta.queueFamily,
@@ -225,8 +254,8 @@ public:
         meta.feats = vk::PhysicalDeviceFeatures2 {
             .pNext = &meta.feats12,
             .features = {
-                .robustBufferAccess = true,
-                .samplerAnisotropy = true,
+                .robustBufferAccess = supported.robustBufferAccess,
+                .samplerAnisotropy = supported.samplerAnisotropy,
             },
         };
         vk::DeviceCreateInfo devCI {

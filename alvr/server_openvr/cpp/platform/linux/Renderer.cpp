@@ -572,8 +572,8 @@ Renderer::Renderer(
         .addressModeV = vk::SamplerAddressMode::eRepeat,
         .addressModeW = vk::SamplerAddressMode::eRepeat,
 
-        .anisotropyEnable = true,
-        .maxAnisotropy = 16.f,
+        .anisotropyEnable = vkCtx.meta.samplerAnisotropy,
+        .maxAnisotropy = std::min(16.f, vkCtx.meta.maxSamplerAnisotropy),
 
         .borderColor = vk::BorderColor::eFloatTransparentBlack,
     };
@@ -649,8 +649,11 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
     vk::CommandBufferBeginInfo beginInfo {};
     cmdBuf.begin(beginInfo);
 
-    cmdBuf.resetQueryPool(timestampPool, 0, 2);
-    cmdBuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timestampPool, 0);
+    // Writing timestamps on a queue without timestamp support is invalid.
+    if (vkCtx.meta.timestamps) {
+        cmdBuf.resetQueryPool(timestampPool, 0, 2);
+        cmdBuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timestampPool, 0);
+    }
 
     auto flushBarriers = [&](std::vector<vk::ImageMemoryBarrier>& barriers,
                              vk::PipelineStageFlags srcStage,
@@ -727,7 +730,9 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
         .layerCount = 1,
     };
 
-    vk::ImageCopy2KHR leftCopy {
+    // Core vkCmdCopyImage: the copy_commands2 entry point needs an extension
+    // some drivers do not list.
+    vk::ImageCopy leftCopy {
         .srcSubresource = subresLayout,
         .srcOffset = {},
         .dstSubresource = subresLayout,
@@ -738,15 +743,13 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
             .depth = 1,
         },
     };
-    vk::CopyImageInfo2KHR leftCopyInfo {
-        .srcImage = inputImages[leftIdx].image,
-        .srcImageLayout = inputImages[leftIdx].layout,
-        .dstImage = stageOut->image,
-        .dstImageLayout = stageOut->layout,
-        .regionCount = 1,
-        .pRegions = &leftCopy,
-    };
-    cmdBuf.copyImage2KHR(leftCopyInfo, vkCtx.dispatch);
+    cmdBuf.copyImage(
+        inputImages[leftIdx].image,
+        inputImages[leftIdx].layout,
+        stageOut->image,
+        stageOut->layout,
+        leftCopy
+    );
 
     auto rightCopy = leftCopy;
     rightCopy.dstOffset = vk::Offset3D {
@@ -754,15 +757,13 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
         .y = 0,
         .z = 0,
     };
-    vk::CopyImageInfo2KHR rightCopyInfo {
-        .srcImage = inputImages[rightIdx].image,
-        .srcImageLayout = inputImages[rightIdx].layout,
-        .dstImage = stageOut->image,
-        .dstImageLayout = stageOut->layout,
-        .regionCount = 1,
-        .pRegions = &rightCopy,
-    };
-    cmdBuf.copyImage2KHR(rightCopyInfo, vkCtx.dispatch);
+    cmdBuf.copyImage(
+        inputImages[rightIdx].image,
+        inputImages[rightIdx].layout,
+        stageOut->image,
+        stageOut->layout,
+        rightCopy
+    );
 
     prev = stageOut;
 
@@ -808,7 +809,9 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
         prev = nextOut;
     }
 
-    cmdBuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timestampPool, 1);
+    if (vkCtx.meta.timestamps) {
+        cmdBuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timestampPool, 1);
+    }
 
     cmdBuf.end();
 
