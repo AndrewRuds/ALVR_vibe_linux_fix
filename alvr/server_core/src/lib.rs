@@ -319,7 +319,20 @@ impl ServerCoreContext {
             Duration::from_millis(SESSION_MANAGER.read().settings().headset.max_prediction_ms);
 
         if latency > max_prediction {
-            warn!("Latency is too high. Clamping prediction");
+            // Called for every pose request, so a latency spike produced
+            // hundreds of identical lines per second.
+            static LAST_WARNING: std::sync::Mutex<Option<std::time::Instant>> =
+                std::sync::Mutex::new(None);
+            if let Ok(mut last) = LAST_WARNING.lock()
+                && last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+            {
+                *last = Some(std::time::Instant::now());
+                warn!(
+                    "Latency is too high ({} ms). Clamping prediction to {} ms",
+                    latency.as_millis(),
+                    max_prediction.as_millis()
+                );
+            }
 
             max_prediction
         } else {

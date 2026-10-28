@@ -523,6 +523,37 @@ void OvrDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 
 /** Submits queued layers for display. */
 void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
+    // Only layer 0 is streamed, whole, ignoring its bounds. Say so when that
+    // drops or distorts something, once per change rather than per frame.
+    {
+        int layerCount = m_submitLayer;
+        if (layerCount > 1 && layerCount != m_loggedLayerCount) {
+            Warn(
+                "SteamVR submitted %d layers; only the first is streamed, the rest are not "
+                "shown\n",
+                layerCount
+            );
+        }
+        m_loggedLayerCount = layerCount;
+
+        if (layerCount > 0) {
+            auto const& b = m_submitLayers[0][0].bounds;
+            bool full = b.uMin == 0.f && b.vMin == 0.f && b.uMax == 1.f && b.vMax == 1.f;
+            if (!full
+                && (b.uMin != m_loggedBounds.uMin || b.vMin != m_loggedBounds.vMin
+                    || b.uMax != m_loggedBounds.uMax || b.vMax != m_loggedBounds.vMax)) {
+                Warn(
+                    "Layer 0 uses texture bounds u %.3f..%.3f v %.3f..%.3f; the whole texture is "
+                    "streamed, so the image may look stretched or cropped\n",
+                    b.uMin,
+                    b.uMax,
+                    b.vMin,
+                    b.vMax
+                );
+            }
+            m_loggedBounds = b;
+        }
+    }
     m_submitLayer = 0;
 
     switch (m_encoderState.load()) {

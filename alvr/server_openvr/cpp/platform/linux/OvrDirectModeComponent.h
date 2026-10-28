@@ -90,6 +90,9 @@ private:
     static const int MAX_LAYERS = 10;
     int m_submitLayer;
     SubmitLayerPerEye_t m_submitLayers[MAX_LAYERS][2];
+    // What Present last logged about the submitted layers.
+    int m_loggedLayerCount = 1;
+    vr::VRTextureBounds_t m_loggedBounds { 0.f, 0.f, 1.f, 1.f };
     vr::HmdQuaternion_t m_prevFramePoseRotation;
     vr::HmdQuaternion_t m_framePoseRotation;
     uint64_t m_targetTimestampNs;
