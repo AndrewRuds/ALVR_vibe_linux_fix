@@ -302,7 +302,16 @@ void OvrDirectModeComponent::EncodeWorkerLoop() {
                 }
             }
 
-            enc.present(job.leftIdx, job.rightIdx, stampTimestampNs, warpParams, job.waitFds);
+            std::vector<alvr::LayerRef> layerRefs;
+            bool const composeLayers = PrepareLayers(job, layerRefs);
+            enc.present(
+                job.leftIdx,
+                job.rightIdx,
+                stampTimestampNs,
+                warpParams,
+                job.waitFds,
+                composeLayers ? &layerRefs : nullptr
+            );
         } catch (std::exception const& e) {
             // An exception escaping a thread's start function is
             // std::terminate, which takes vrserver with it. Same recovery as
@@ -346,6 +355,13 @@ void OvrDirectModeComponent::CreateSwapTextureSet(
         pSwapTextureSetDesc->nSampleCount
     );
 
+    // Report an empty set unless every texture is created; the flags are
+    // ours to fill in and were left uninitialized before.
+    pOutSwapTextureSet->unTextureFlags = 0;
+    for (auto& handle : pOutSwapTextureSet->rSharedTextureHandles) {
+        handle = 0;
+    }
+
     ProcessResource* processResource = new ProcessResource();
     processResource->textDesc = *pSwapTextureSetDesc;
     processResource->pid = unPid;
@@ -381,14 +397,17 @@ void OvrDirectModeComponent::CreateSwapTextureSet(
             &myHandle
         );
 
-        uint64_t ipcHandle = 0;
-        vr::VRIPCResourceManager()->RefResource(myHandle, &ipcHandle);
-
         if (!success) {
             Error("VRCIPCResourceManager: Failed to create shared texture\n");
             CleanupProcessResource(processResource);
+            for (auto& handle : pOutSwapTextureSet->rSharedTextureHandles) {
+                handle = 0;
+            }
             return;
         }
+
+        uint64_t ipcHandle = 0;
+        vr::VRIPCResourceManager()->RefResource(myHandle, &ipcHandle);
 
         int fd = 0;
         auto ret = vr::VRIPCResourceManager()->ReceiveSharedFd(ipcHandle, &fd);
@@ -396,6 +415,9 @@ void OvrDirectModeComponent::CreateSwapTextureSet(
             Error("Failed to get fd for texture\n");
             vr::VRIPCResourceManager()->UnrefResource(myHandle);
             CleanupProcessResource(processResource);
+            for (auto& handle : pOutSwapTextureSet->rSharedTextureHandles) {
+                handle = 0;
+            }
             return;
         }
 
@@ -444,6 +466,14 @@ void OvrDirectModeComponent::DestroyAllSwapTextureSets(uint32_t unPid) {
 }
 
 void OvrDirectModeComponent::CleanupProcessResource(ProcessResource* processResource) {
+    {
+        std::lock_guard<std::mutex> lock(m_evictMutex);
+        for (int i = 0; i < 3; i++) {
+            if (processResource->sharedHandles[i]) {
+                m_pendingEvictions.push_back(processResource->sharedHandles[i]);
+            }
+        }
+    }
     for (int i = 0; i < 3; i++) {
         if (processResource->sharedHandles[i]) {
             vr::VRIPCResourceManager()->UnrefResource(processResource->sharedHandles[i]);
@@ -469,6 +499,12 @@ void OvrDirectModeComponent::GetNextSwapTextureSetIndex(
     for (int eye = 0; eye < 2; eye++) {
         auto it = m_handleMap.find(sharedTextureHandles[eye]);
         if (it == m_handleMap.end()) {
+            // A set this component does not hold (already destroyed, e.g.
+            // while SteamVR shuts down). Leaving the index unset hands the
+            // compositor an uninitialized value to index its set with.
+            if (pIndices) {
+                (*pIndices)[eye] = 0;
+            }
             continue;
         }
         auto& idx = m_swapchainIndices[it->second.first];
@@ -523,36 +559,10 @@ void OvrDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 
 /** Submits queued layers for display. */
 void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
-    // Only layer 0 is streamed, whole, ignoring its bounds. Say so when that
-    // drops or distorts something, once per change rather than per frame.
-    {
-        int layerCount = m_submitLayer;
-        if (layerCount > 1 && layerCount != m_loggedLayerCount) {
-            Warn(
-                "SteamVR submitted %d layers; only the first is streamed, the rest are not "
-                "shown\n",
-                layerCount
-            );
-        }
+    int const layerCount = std::min(m_submitLayer, MAX_LAYERS);
+    if (layerCount != m_loggedLayerCount) {
+        Info("SteamVR is submitting %d layer(s) per frame\n", layerCount);
         m_loggedLayerCount = layerCount;
-
-        if (layerCount > 0) {
-            auto const& b = m_submitLayers[0][0].bounds;
-            bool full = b.uMin == 0.f && b.vMin == 0.f && b.uMax == 1.f && b.vMax == 1.f;
-            if (!full
-                && (b.uMin != m_loggedBounds.uMin || b.vMin != m_loggedBounds.vMin
-                    || b.uMax != m_loggedBounds.uMax || b.vMax != m_loggedBounds.vMax)) {
-                Warn(
-                    "Layer 0 uses texture bounds u %.3f..%.3f v %.3f..%.3f; the whole texture is "
-                    "streamed, so the image may look stretched or cropped\n",
-                    b.uMin,
-                    b.uMax,
-                    b.vMin,
-                    b.vMax
-                );
-            }
-            m_loggedBounds = b;
-        }
     }
     m_submitLayer = 0;
 
@@ -715,9 +725,36 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
         return;
     }
 
-    // TODO: Merge layers or something
-
     FrameJob job {};
+    // Every submitted layer, so the worker can compose them like the Windows
+    // renderer does: the first opaque, the rest alpha blended over it, each
+    // sampled within its bounds and rotated into the first layer's view.
+    {
+        auto const& base = m_submitLayers[0][0].mHmdPose.m;
+        job.layerCount = (uint32_t)layerCount;
+        for (int i = 0; i < layerCount; ++i) {
+            auto& layer = job.layers[i];
+            layer.left = m_submitLayers[i][0].hTexture;
+            layer.right = m_submitLayers[i][1].hTexture;
+            layer.boundsL = m_submitLayers[i][0].bounds;
+            layer.boundsR = m_submitLayers[i][1].bounds;
+
+            // R_i^T * R_0 from the rotation parts of the world-from-head poses.
+            auto const& pose = m_submitLayers[i][0].mHmdPose.m;
+            for (int c = 0; c < 3; ++c) {
+                for (int r = 0; r < 3; ++r) {
+                    float v = 0.f;
+                    for (int k = 0; k < 3; ++k) {
+                        v += pose[k][r] * base[k][c];
+                    }
+                    layer.rotation[c * 3 + r] = v;
+                    if (std::fabs(v - (r == c ? 1.f : 0.f)) > 1e-5f) {
+                        layer.rotated = true;
+                    }
+                }
+            }
+        }
+    }
     job.leftIdx = leftIdx.value();
     job.rightIdx = rightIdx.value();
     job.targetTimestampNs = m_targetTimestampNs;
@@ -757,6 +794,115 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
         m_jobPending = true;
     }
     m_jobCv.notify_one();
+}
+
+bool OvrDirectModeComponent::PrepareLayers(FrameJob const& job, std::vector<alvr::LayerRef>& out) {
+    // Drop imports of destroyed sets first, so their memory goes back
+    // before anything new is imported.
+    std::vector<uint64_t> evictions;
+    {
+        std::lock_guard<std::mutex> lock(m_evictMutex);
+        evictions.swap(m_pendingEvictions);
+    }
+    if (!evictions.empty()) {
+        enc.evictLayerImages(evictions);
+        for (auto key : evictions) {
+            m_failedLayerImports.erase(key);
+        }
+    }
+
+    auto fullBounds = [](vr::VRTextureBounds_t const& b) {
+        return b.uMin == 0.f && b.vMin == 0.f && b.uMax == 1.f && b.vMax == 1.f;
+    };
+    if (job.layerCount == 0
+        || (job.layerCount == 1 && fullBounds(job.layers[0].boundsL)
+            && fullBounds(job.layers[0].boundsR))) {
+        return false;
+    }
+
+    // Per-eye view tangents for rotating layers into the first one's view.
+    float tans[2][4] = {};
+    bool tansValid = false;
+    {
+        std::unique_lock<std::mutex> lock(m_viewParamsMutex);
+        if (m_viewParamsValid) {
+            for (int e = 0; e < 2; ++e) {
+                auto const& fov = m_viewParams[e].fov;
+                tans[e][0] = tanf(fov.left);
+                tans[e][1] = tanf(fov.right);
+                tans[e][2] = tanf(fov.up);
+                tans[e][3] = tanf(fov.down);
+            }
+            tansValid = tans[0][1] != tans[0][0] && tans[1][1] != tans[1][0]
+                && tans[0][2] != tans[0][3] && tans[1][2] != tans[1][3];
+        }
+    }
+
+    auto ensureImported = [&](vr::SharedTextureHandle_t handle) {
+        if (handle == 0 || enc.hasLayerImage(handle) || m_failedLayerImports.count(handle)) {
+            return;
+        }
+        int fd = -1;
+        SwapTextureSetDesc_t desc {};
+        {
+            std::lock_guard<std::mutex> lock(m_presentMutex);
+            auto it = m_handleMap.find(handle);
+            if (it != m_handleMap.end()) {
+                fd = dup(it->second.first->fds[it->second.second]);
+                desc = it->second.first->textDesc;
+            }
+        }
+        if (fd < 0) {
+            return;
+        }
+        try {
+            enc.importLayerImage(
+                handle, fd, vk::Format(desc.nFormat), vk::Extent2D { desc.nWidth, desc.nHeight }
+            );
+        } catch (std::exception const& e) {
+            m_failedLayerImports.insert(handle);
+            Error(
+                "Could not import a layer texture (%s); that layer will not be shown\n", e.what()
+            );
+        }
+    };
+
+    auto toArray = [](vr::VRTextureBounds_t const& b, float out[4]) {
+        out[0] = b.uMin;
+        out[1] = b.vMin;
+        out[2] = b.uMax;
+        out[3] = b.vMax;
+    };
+
+    out.clear();
+    for (uint32_t i = 0; i < job.layerCount; ++i) {
+        auto const& layer = job.layers[i];
+        alvr::LayerRef ref;
+        if (i > 0) {
+            ensureImported(layer.left);
+            ensureImported(layer.right);
+            ref.left = layer.left;
+            ref.right = layer.right;
+        }
+        toArray(layer.boundsL, ref.params.boundsL);
+        toArray(layer.boundsR, ref.params.boundsR);
+        if (layer.rotated && tansValid) {
+            for (int c = 0; c < 3; ++c) {
+                float* col = c == 0 ? ref.params.rotCol0
+                    : c == 1        ? ref.params.rotCol1
+                                    : ref.params.rotCol2;
+                col[0] = layer.rotation[c * 3 + 0];
+                col[1] = layer.rotation[c * 3 + 1];
+                col[2] = layer.rotation[c * 3 + 2];
+                col[3] = 0.f;
+            }
+            memcpy(ref.params.tansL, tans[0], sizeof(tans[0]));
+            memcpy(ref.params.tansR, tans[1], sizeof(tans[1]));
+            ref.params.warp = 1;
+        }
+        out.push_back(ref);
+    }
+    return true;
 }
 
 void OvrDirectModeComponent::PostPresent(const Throttling_t* pThrottling) {

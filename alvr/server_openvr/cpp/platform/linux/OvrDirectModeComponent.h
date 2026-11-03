@@ -11,7 +11,9 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -79,8 +81,9 @@ private:
 
     // Resource for each process
     struct ProcessResource {
-        vr::SharedTextureHandle_t sharedHandles[3];
-        int fds[3];
+        vr::SharedTextureHandle_t sharedHandles[3] = {};
+        // -1 until received: cleanup after a partial failure must not close fd 0.
+        int fds[3] = { -1, -1, -1 };
         SwapTextureSetDesc_t textDesc;
         uint32_t pid;
     };
@@ -90,9 +93,8 @@ private:
     static const int MAX_LAYERS = 10;
     int m_submitLayer;
     SubmitLayerPerEye_t m_submitLayers[MAX_LAYERS][2];
-    // What Present last logged about the submitted layers.
+    // Layer count Present last logged, to report changes only.
     int m_loggedLayerCount = 1;
-    vr::VRTextureBounds_t m_loggedBounds { 0.f, 0.f, 1.f, 1.f };
     vr::HmdQuaternion_t m_prevFramePoseRotation;
     vr::HmdQuaternion_t m_framePoseRotation;
     uint64_t m_targetTimestampNs;
@@ -136,7 +138,27 @@ private:
         // presenting it must close them.
         int waitFds[2] = { -1, -1 };
         std::chrono::steady_clock::time_point enqueueTime;
+
+        // Every layer SteamVR submitted this frame, first one included. The
+        // first is read from the renderer's own input images (leftIdx and
+        // rightIdx); the others by shared texture handle.
+        struct Layer {
+            vr::SharedTextureHandle_t left = 0;
+            vr::SharedTextureHandle_t right = 0;
+            vr::VRTextureBounds_t boundsL { 0.f, 0.f, 1.f, 1.f };
+            vr::VRTextureBounds_t boundsR { 0.f, 0.f, 1.f, 1.f };
+            // Source-from-destination rotation from the first layer's head
+            // orientation to this layer's, column-major 3x3.
+            float rotation[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+            bool rotated = false;
+        };
+        uint32_t layerCount = 0;
+        Layer layers[MAX_LAYERS];
     };
+    // Builds the layer list for the encoder, importing textures of layers it
+    // has not seen yet. Worker thread, with m_encMutex held. Returns false
+    // when the plain copy of the first layer is enough.
+    bool PrepareLayers(FrameJob const& job, std::vector<alvr::LayerRef>& out);
     void EncodeWorkerLoop();
     // Drop a pending job. Call before any path that touches the encoder from
     // the compositor thread.
@@ -173,4 +195,12 @@ private:
     std::mutex m_viewParamsMutex;
     FfiViewParams m_viewParams[2] {};
     bool m_viewParamsValid = false;
+
+    // Shared texture handles of destroyed sets, waiting for the worker to
+    // drop their imports. Filled under m_presentMutex, so this mutex is only
+    // ever taken last.
+    std::mutex m_evictMutex;
+    std::vector<uint64_t> m_pendingEvictions;
+    // Worker only: textures that failed to import, not retried.
+    std::set<uint64_t> m_failedLayerImports;
 };

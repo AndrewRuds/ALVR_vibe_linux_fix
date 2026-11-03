@@ -1,5 +1,7 @@
 #include "Renderer.hpp"
 
+#include "alvr_server/bindings.h"
+
 #include <optional>
 #include <unistd.h>
 #include <vulkan/vulkan_structs.hpp>
@@ -445,16 +447,16 @@ Output createOutputImage(
 // since SteamVR's image has none. A list could let the driver choose a
 // different memory layout (e.g. compression) than the exporter did.
 // MUTABLE_FORMAT is what makes the UNORM view of an sRGB image legal.
-static vk::ImageCreateInfo makeInputImageCI(RendererCreateInfo const& createInfo) {
+static vk::ImageCreateInfo makeImportImageCI(vk::Format format, vk::Extent2D extent) {
     // TODO: Only put the usage flags for the images that need to have them
     return vk::ImageCreateInfo {
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
-        .format = createInfo.format,
+        .format = format,
 
         .extent = {
-            .width = createInfo.inputEyeExtent.width,
-            .height = createInfo.inputEyeExtent.height,
+            .width = extent.width,
+            .height = extent.height,
             .depth = 1,
         },
 
@@ -466,6 +468,10 @@ static vk::ImageCreateInfo makeInputImageCI(RendererCreateInfo const& createInfo
         .sharingMode = vk::SharingMode::eExclusive,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
+}
+
+static vk::ImageCreateInfo makeInputImageCI(RendererCreateInfo const& createInfo) {
+    return makeImportImageCI(createInfo.format, createInfo.inputEyeExtent);
 }
 
 namespace alvr::render {
@@ -616,9 +622,127 @@ Renderer::Renderer(
     // renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
 
     fence = vkCtx.dev.createFence({});
+
+    createComposePipeline(vkCtx);
 }
 
-void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2]) {
+void Renderer::createComposePipeline(VkContext const& vkCtx) {
+    // Clamp, not repeat: a layer sampled at its bounds' edge must not pick up
+    // the opposite edge of the texture.
+    composeSampler = vkCtx.dev.createSampler({
+        .magFilter = vk::Filter::eLinear,
+        .minFilter = vk::Filter::eLinear,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        .borderColor = vk::BorderColor::eFloatTransparentBlack,
+    });
+
+    vk::DescriptorSetLayoutBinding bindings[3] = {
+        {
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .pImmutableSamplers = &composeSampler,
+        },
+        {
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .pImmutableSamplers = &composeSampler,
+        },
+        {
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    composeDescLayout = vkCtx.dev.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = 3,
+        .pBindings = bindings,
+    });
+
+    vk::PushConstantRange pushRange {
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = sizeof(ComposeParams),
+    };
+    composePipeLayout = vkCtx.dev.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &composeDescLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushRange,
+    });
+
+    composeShader = vkCtx.dev.createShaderModule({
+        .codeSize = COMPOSE_SHADER_COMP_SPV_LEN,
+        .pCode = reinterpret_cast<u32 const*>(COMPOSE_SHADER_COMP_SPV_PTR),
+    });
+    vk::ComputePipelineCreateInfo pipeCI {
+        .stage = {
+            .stage = vk::ShaderStageFlagBits::eCompute,
+            .module = composeShader,
+            .pName = "main",
+        },
+        .layout = composePipeLayout,
+    };
+    auto [result, created] = vkCtx.dev.createComputePipelines({}, pipeCI);
+    if (result != vk::Result::eSuccess) {
+        throw std::runtime_error("failed to create the layer composition pipeline");
+    }
+    composePipe = created[0];
+}
+
+Image* Renderer::findLayerImage(u64 key) {
+    auto it = layerImages.find(key);
+    return it == layerImages.end() ? nullptr : &it->second;
+}
+
+Image* Renderer::importLayerImage(
+    VkContext const& ctx, u64 key, int fd, vk::Format format, vk::Extent2D extent
+) {
+    if (auto* existing = findLayerImage(key)) {
+        close(fd);
+        return existing;
+    }
+    try {
+        auto img = createImage(ctx, makeImportImageCI(format, extent), fd, unormFormatOf(format));
+        return &layerImages.emplace(key, img).first->second;
+    } catch (...) {
+        // createImage only hands the fd to Vulkan once the allocation succeeds.
+        close(fd);
+        throw;
+    }
+}
+
+void Renderer::evictLayerImages(VkContext const& ctx, std::vector<u64> const& keys) {
+    bool waited = false;
+    for (auto key : keys) {
+        auto it = layerImages.find(key);
+        if (it == layerImages.end()) {
+            continue;
+        }
+        if (!waited) {
+            ctx.dev.waitIdle();
+            waited = true;
+        }
+        it->second.destroy(ctx);
+        layerImages.erase(it);
+    }
+}
+
+void Renderer::render(
+    VkContext& vkCtx,
+    u32 leftIdx,
+    u32 rightIdx,
+    int const waitFds[2],
+    std::vector<ComposeLayer> const* layers
+) {
     // Import the input writers' sync files as temporary binary semaphores;
     // the submission below waits on them at the transfer stage, so the eye
     // copies start exactly when the writes complete.
@@ -697,73 +821,180 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
 
     // Copy the left and right eye images into the first working image.
     Image* stageOut = pipes.empty() ? &output.image : &stagingImgs[0];
-    transitionImage(
-        inputImages[leftIdx],
-        vk::ImageLayout::eGeneral,
-        vk::AccessFlagBits::eNone,
-        vk::AccessFlagBits::eTransferRead,
-        barriers
-    );
-    transitionImage(
-        inputImages[rightIdx],
-        vk::ImageLayout::eGeneral,
-        vk::AccessFlagBits::eNone,
-        vk::AccessFlagBits::eTransferRead,
-        barriers
-    );
-    transitionImage(
-        *stageOut,
-        vk::ImageLayout::eGeneral,
-        vk::AccessFlagBits::eNone,
-        vk::AccessFlagBits::eTransferWrite,
-        barriers
-    );
+    bool const compose = layers != nullptr && !layers->empty();
+    if (compose) {
+        // Every layer's textures are read by the compose shader; the stereo
+        // image is written by it.
+        for (auto const& layer : *layers) {
+            Image* l = layer.left ? layer.left : &inputImages[leftIdx];
+            Image* r = layer.right ? layer.right : &inputImages[rightIdx];
+            transitionImage(
+                *l,
+                vk::ImageLayout::eGeneral,
+                vk::AccessFlagBits::eNone,
+                vk::AccessFlagBits::eShaderRead,
+                barriers
+            );
+            transitionImage(
+                *r,
+                vk::ImageLayout::eGeneral,
+                vk::AccessFlagBits::eNone,
+                vk::AccessFlagBits::eShaderRead,
+                barriers
+            );
+        }
+        transitionImage(
+            *stageOut,
+            vk::ImageLayout::eGeneral,
+            vk::AccessFlagBits::eNone,
+            vk::AccessFlagBits::eShaderWrite,
+            barriers
+        );
+        flushBarriers(
+            barriers,
+            vk::PipelineStageFlagBits::eBottomOfPipe,
+            vk::PipelineStageFlagBits::eComputeShader
+        );
 
-    flushBarriers(
-        barriers, vk::PipelineStageFlagBits::eBottomOfPipe, vk::PipelineStageFlagBits::eTransfer
-    );
+        cmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, composePipe);
+        vk::Extent3D const target { eyeExtent.width * 2, eyeExtent.height, 1 };
+        for (usize i = 0; i < layers->size(); ++i) {
+            auto const& layer = (*layers)[i];
+            Image* l = layer.left ? layer.left : &inputImages[leftIdx];
+            Image* r = layer.right ? layer.right : &inputImages[rightIdx];
 
-    vk::ImageSubresourceLayers subresLayout {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .mipLevel = 0,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
-    };
+            vk::DescriptorImageInfo leftInfo {
+                .imageView = l->view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+            };
+            vk::DescriptorImageInfo rightInfo {
+                .imageView = r->view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+            };
+            vk::DescriptorImageInfo outInfo {
+                .imageView = stageOut->view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+            };
+            vk::WriteDescriptorSet writes[3] = {
+                {
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &leftInfo,
+                },
+                {
+                    .dstBinding = 1,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &rightInfo,
+                },
+                {
+                    .dstBinding = 2,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageImage,
+                    .pImageInfo = &outInfo,
+                },
+            };
+            cmdBuf.pushDescriptorSetKHR(
+                vk::PipelineBindPoint::eCompute, composePipeLayout, 0, writes, vkCtx.dispatch
+            );
 
-    // Core vkCmdCopyImage: the copy_commands2 entry point needs an extension
-    // some drivers do not list.
-    vk::ImageCopy leftCopy {
-        .srcSubresource = subresLayout,
-        .srcOffset = {},
-        .dstSubresource = subresLayout,
-        .dstOffset = {},
-        .extent = {
-            .width = eyeExtent.width,
-            .height = eyeExtent.height,
-            .depth = 1,
-        },
-    };
-    cmdBuf.copyImage(
-        inputImages[leftIdx].image,
-        inputImages[leftIdx].layout,
-        stageOut->image,
-        stageOut->layout,
-        leftCopy
-    );
+            ComposeParams params = layer.params;
+            params.first = i == 0 ? 1 : 0;
+            cmdBuf.pushConstants(
+                composePipeLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params
+            );
+            cmdBuf.dispatch((target.width + 7) / 8, (target.height + 7) / 8, 1);
 
-    auto rightCopy = leftCopy;
-    rightCopy.dstOffset = vk::Offset3D {
-        .x = static_cast<int32_t>(eyeExtent.width),
-        .y = 0,
-        .z = 0,
-    };
-    cmdBuf.copyImage(
-        inputImages[rightIdx].image,
-        inputImages[rightIdx].layout,
-        stageOut->image,
-        stageOut->layout,
-        rightCopy
-    );
+            // The next layer blends over what this one wrote.
+            vk::ImageMemoryBarrier blendBarrier {
+                .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = stageOut->image,
+                .subresourceRange = { vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 },
+            };
+            cmdBuf.pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader,
+                vk::PipelineStageFlagBits::eComputeShader,
+                {},
+                {},
+                {},
+                blendBarrier
+            );
+        }
+    } else {
+        transitionImage(
+            inputImages[leftIdx],
+            vk::ImageLayout::eGeneral,
+            vk::AccessFlagBits::eNone,
+            vk::AccessFlagBits::eTransferRead,
+            barriers
+        );
+        transitionImage(
+            inputImages[rightIdx],
+            vk::ImageLayout::eGeneral,
+            vk::AccessFlagBits::eNone,
+            vk::AccessFlagBits::eTransferRead,
+            barriers
+        );
+        transitionImage(
+            *stageOut,
+            vk::ImageLayout::eGeneral,
+            vk::AccessFlagBits::eNone,
+            vk::AccessFlagBits::eTransferWrite,
+            barriers
+        );
+
+        flushBarriers(
+            barriers, vk::PipelineStageFlagBits::eBottomOfPipe, vk::PipelineStageFlagBits::eTransfer
+        );
+
+        vk::ImageSubresourceLayers subresLayout {
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+
+        // Core vkCmdCopyImage: the copy_commands2 entry point needs an extension
+        // some drivers do not list.
+        vk::ImageCopy leftCopy {
+            .srcSubresource = subresLayout,
+            .srcOffset = {},
+            .dstSubresource = subresLayout,
+            .dstOffset = {},
+            .extent = {
+                .width = eyeExtent.width,
+                .height = eyeExtent.height,
+                .depth = 1,
+            },
+        };
+        cmdBuf.copyImage(
+            inputImages[leftIdx].image,
+            inputImages[leftIdx].layout,
+            stageOut->image,
+            stageOut->layout,
+            leftCopy
+        );
+
+        auto rightCopy = leftCopy;
+        rightCopy.dstOffset = vk::Offset3D {
+            .x = static_cast<int32_t>(eyeExtent.width),
+            .y = 0,
+            .z = 0,
+        };
+        cmdBuf.copyImage(
+            inputImages[rightIdx].image,
+            inputImages[rightIdx].layout,
+            stageOut->image,
+            stageOut->layout,
+            rightCopy
+        );
+    }
 
     prev = stageOut;
 
@@ -819,9 +1050,11 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const wai
     //     .waitSemaphoreValueCount = 1,
     //     .pWaitSemaphoreValues = &waitValue,
     // };
+    // The first reads are the eye copies (transfer) or the compose pass
+    // (compute), depending on the path taken.
     vk::PipelineStageFlags waitStages[2] = {
-        vk::PipelineStageFlagBits::eTransfer,
-        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
     };
     vk::SubmitInfo submitInfo {
         // .pNext = &timelineInfo,
@@ -892,6 +1125,16 @@ void Renderer::replaceInputs(VkContext const& ctx, RendererCreateInfo& createInf
 
 void Renderer::destroy(VkContext const& ctx) {
     // ctx.dev.destroy(renderFinishedSem);
+
+    for (auto& [key, img] : layerImages) {
+        img.destroy(ctx);
+    }
+    layerImages.clear();
+    ctx.dev.destroy(composePipe);
+    ctx.dev.destroy(composePipeLayout);
+    ctx.dev.destroy(composeDescLayout);
+    ctx.dev.destroy(composeShader);
+    ctx.dev.destroy(composeSampler);
 
     for (auto& pipe : pipes) {
         pipe.destroy(ctx);

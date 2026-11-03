@@ -96,6 +96,15 @@ inline auto makeFoveation(Settings const& settings) {
     return std::tuple(info, outSize);
 }
 
+// A SteamVR layer as the direct mode component sees it: shared texture
+// handles per eye (0 = the first layer's set, already imported by the
+// renderer) and the composition parameters.
+struct LayerRef {
+    u64 left = 0;
+    u64 right = 0;
+    render::ComposeParams params;
+};
+
 class Encoder {
     vk::Extent2D outExtent;
 
@@ -325,12 +334,33 @@ public:
 
     // waitFds are sync_file fds the render submission must wait on before
     // sampling the eye textures; ownership transfers here on every path.
+    // Extra-layer texture cache, forwarded to the renderer. All three are
+    // no-ops (import closes the fd) while no renderer exists.
+    bool hasLayerImage(u64 key) {
+        return renderer.hasValue() && renderer.get().findLayerImage(key) != nullptr;
+    }
+    void importLayerImage(u64 key, int fd, vk::Format format, vk::Extent2D extent) {
+        if (!renderer.hasValue()) {
+            close(fd);
+            return;
+        }
+        renderer.get().importLayerImage(ctx(), key, fd, format, extent);
+    }
+    void evictLayerImages(std::vector<u64> const& keys) {
+        if (renderer.hasValue() && !keys.empty()) {
+            renderer.get().evictLayerImages(ctx(), keys);
+        }
+    }
+
+    // layers, when non-null, are composed instead of copying the first layer.
+    // Layers whose textures are not imported are skipped.
     void present(
         u32 leftIdx,
         u32 rightIdx,
         u64 targetTimestampNs,
         render::WarpParams const& warp,
-        int const waitFds[2]
+        int const waitFds[2],
+        std::vector<LayerRef> const* layers = nullptr
     ) {
         if (!encoder) {
             for (int e = 0; e < 2; ++e) {
@@ -348,7 +378,30 @@ public:
         renderer.get().warpParams = warp;
         ReportPresent(targetTimestampNs, 0);
         updateFoveationCenters(targetTimestampNs);
-        renderer.get().render(ctx(), leftIdx, rightIdx, waitFds);
+        std::vector<render::ComposeLayer> compose;
+        if (layers != nullptr) {
+            compose.reserve(layers->size());
+            for (auto const& ref : *layers) {
+                render::ComposeLayer layer { .params = ref.params };
+                if (ref.left != 0 || ref.right != 0) {
+                    layer.left = renderer.get().findLayerImage(ref.left);
+                    layer.right = renderer.get().findLayerImage(ref.right);
+                    if (layer.left == nullptr || layer.right == nullptr) {
+                        continue;
+                    }
+                }
+                compose.push_back(layer);
+            }
+        }
+        // A lone first layer covering its whole texture is the plain copy.
+        auto fullBounds = [](float const b[4]) {
+            return b[0] == 0.f && b[1] == 0.f && b[2] == 1.f && b[3] == 1.f;
+        };
+        bool const trivial = compose.size() == 1 && compose[0].left == nullptr
+            && fullBounds(compose[0].params.boundsL) && fullBounds(compose[0].params.boundsR);
+        renderer.get().render(
+            ctx(), leftIdx, rightIdx, waitFds, compose.empty() || trivial ? nullptr : &compose
+        );
         ReportComposed(targetTimestampNs, 0);
 
         encoder->SetParams(GetDynamicEncoderParams());

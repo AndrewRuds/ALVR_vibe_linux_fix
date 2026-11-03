@@ -12,6 +12,9 @@
 #include "VkContext.hpp"
 #include "utils.hpp"
 
+#include <map>
+#include <vector>
+
 #include "ffmpeg_helper.h"
 
 namespace alvr::render {
@@ -115,6 +118,32 @@ struct PushConstants {
 static_assert(sizeof(PushConstants) == 128);
 static_assert(offsetof(PushConstants, centerShifts) == 112);
 
+// Push constants of compose.comp, one layer per dispatch. Offsets must match
+// the GLSL block.
+struct ComposeParams {
+    float rotCol0[4] = { 1, 0, 0, 0 }; // source-from-destination rotation, mat3 columns
+    float rotCol1[4] = { 0, 1, 0, 0 };
+    float rotCol2[4] = { 0, 0, 1, 0 };
+    float boundsL[4] = { 0, 0, 1, 1 }; // uMin, vMin, uMax, vMax
+    float boundsR[4] = { 0, 0, 1, 1 };
+    float tansL[4] = {}; // tanLeft, tanRight, tanUp, tanDown
+    float tansR[4] = {};
+    u32 first = 0;
+    u32 warp = 0;
+};
+static_assert(sizeof(ComposeParams) == 120);
+static_assert(offsetof(ComposeParams, boundsL) == 48);
+static_assert(offsetof(ComposeParams, tansL) == 80);
+static_assert(offsetof(ComposeParams, first) == 112);
+
+// One SteamVR layer to compose. left/right null means the renderer's own
+// input images at the indices passed to render() (the first layer's set).
+struct ComposeLayer {
+    Image* left = nullptr;
+    Image* right = nullptr;
+    ComposeParams params;
+};
+
 namespace detail {
 
     class RenderPipeline {
@@ -158,9 +187,22 @@ class Renderer {
 
     std::vector<detail::RenderPipeline> pipes;
 
+    // Layer composition (compose.comp), used when SteamVR submits more than
+    // one layer or the first layer covers only part of its texture.
+    vk::ShaderModule composeShader;
+    vk::DescriptorSetLayout composeDescLayout;
+    vk::PipelineLayout composePipeLayout;
+    vk::Pipeline composePipe;
+    vk::Sampler composeSampler;
+
+    // Swap textures of layers other than the first, imported on first use and
+    // keyed by SteamVR's shared texture handle.
+    std::map<u64, Image> layerImages;
+
     // vk::Semaphore renderFinishedSem;
 
     void createInputs(VkContext const& vkCtx, RendererCreateInfo& createInfo);
+    void createComposePipeline(VkContext const& vkCtx);
 
 public:
     Renderer(
@@ -183,7 +225,22 @@ public:
     // the submission waits on before the eye copies. Ownership transfers to
     // this call: a successful import hands the fd to Vulkan, a failed one is
     // closed here.
-    void render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2] = nullptr);
+    // layers, when given, are composed into the stereo image instead of the
+    // plain copy of the first layer; pass null for the single full layer case.
+    void render(
+        VkContext& vkCtx,
+        u32 leftIdx,
+        u32 rightIdx,
+        int const waitFds[2] = nullptr,
+        std::vector<ComposeLayer> const* layers = nullptr
+    );
+
+    // Extra-layer texture cache. importLayerImage takes ownership of fd (and
+    // closes it if the import fails, then throws).
+    Image* findLayerImage(u64 key);
+    Image*
+    importLayerImage(VkContext const& ctx, u64 key, int fd, vk::Format format, vk::Extent2D extent);
+    void evictLayerImages(VkContext const& ctx, std::vector<u64> const& keys);
 
     WarpParams warpParams {};
 

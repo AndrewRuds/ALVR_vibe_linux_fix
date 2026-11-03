@@ -1,0 +1,82 @@
+#version 450
+
+// Composes one SteamVR layer into the side-by-side stereo staging image.
+// Dispatched once per layer, in submission order: the first layer is written
+// opaque (its alpha ignored, as on Windows), later layers are alpha blended
+// over what is already there.
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (binding = 0) uniform sampler2D leftTex;
+layout (binding = 1) uniform sampler2D rightTex;
+layout (binding = 2, rgba8) uniform image2D outImg;
+
+// 120 bytes, inside the 128 every device guarantees. Field offsets must match
+// render::ComposeParams.
+layout (push_constant) uniform Layer {
+    // Source-from-destination view rotation (R_layer^T * R_first), columns of
+    // a mat3 padded to vec4. Applied to each output pixel's view ray so a
+    // layer rendered from another head orientation lines up with the first.
+    vec4 rotCol0;
+    vec4 rotCol1;
+    vec4 rotCol2;
+    // Valid texture region per eye: uMin, vMin, uMax, vMax. A flipped image
+    // has min > max, which the mapping below handles as is.
+    vec4 boundsL;
+    vec4 boundsR;
+    // tanLeft, tanRight, tanUp, tanDown per eye; only read when warping.
+    vec4 tansL;
+    vec4 tansR;
+    uint first;
+    uint warp;
+} pc;
+
+void main()
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImg);
+    if (pos.x >= size.x || pos.y >= size.y) {
+        return;
+    }
+
+    int halfWidth = size.x / 2;
+    bool isRight = pos.x >= halfWidth;
+    vec2 uv = vec2(
+        (float(pos.x - (isRight ? halfWidth : 0)) + 0.5) / float(halfWidth),
+        (float(pos.y) + 0.5) / float(size.y)
+    );
+
+    bool inside = true;
+    if (pc.warp != 0u) {
+        vec4 tans = isRight ? pc.tansR : pc.tansL;
+        vec3 ray = vec3(mix(tans.x, tans.y, uv.x), mix(tans.z, tans.w, uv.y), -1.0);
+        vec3 src = mat3(pc.rotCol0.xyz, pc.rotCol1.xyz, pc.rotCol2.xyz) * ray;
+        if (src.z >= 0.0) {
+            inside = false;
+        } else {
+            vec2 ndc = src.xy / -src.z;
+            uv = vec2((ndc.x - tans.x) / (tans.y - tans.x), (ndc.y - tans.z) / (tans.w - tans.z));
+            inside = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)));
+        }
+    }
+
+    vec4 b = isRight ? pc.boundsR : pc.boundsL;
+    vec2 texUv = mix(b.xy, b.zw, clamp(uv, 0.0, 1.0));
+    // Keep the filter footprint inside the bounds, so a texture holding both
+    // eyes does not bleed the other eye in at the seam.
+    vec2 halfTexel = 0.5 / vec2(isRight ? textureSize(rightTex, 0) : textureSize(leftTex, 0));
+    vec2 lo = min(b.xy, b.zw) + halfTexel;
+    vec2 hi = max(b.xy, b.zw) - halfTexel;
+    texUv = clamp(texUv, min(lo, hi), max(lo, hi));
+    vec4 color = isRight ? texture(rightTex, texUv) : texture(leftTex, texUv);
+
+    if (pc.first != 0u) {
+        // Outside the rotated view the base layer has nothing to show.
+        imageStore(outImg, pos, inside ? vec4(color.rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    if (!inside || color.a <= 0.0) {
+        return;
+    }
+    vec4 dst = imageLoad(outImg, pos);
+    imageStore(outImg, pos, vec4(mix(dst.rgb, color.rgb, color.a), 1.0));
+}

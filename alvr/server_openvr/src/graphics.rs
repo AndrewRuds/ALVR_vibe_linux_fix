@@ -12,6 +12,8 @@ static COLOR_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shad
 static FFR_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/ffr.comp.spv");
 static RGBTOYUV420_SHADER_COMP_SPV: &[u8] =
     include_bytes!("../cpp/platform/linux/shader/rgbtoyuv420.comp.spv");
+static COMPOSE_SHADER_COMP_SPV: &[u8] =
+    include_bytes!("../cpp/platform/linux/shader/compose.comp.spv");
 
 pub fn initialize_shaders() {
     unsafe {
@@ -35,5 +37,7 @@ pub fn initialize_shaders() {
         crate::FFR_SHADER_COMP_SPV_LEN = FFR_SHADER_COMP_SPV.len() as _;
         crate::RGBTOYUV420_SHADER_COMP_SPV_PTR = RGBTOYUV420_SHADER_COMP_SPV.as_ptr();
         crate::RGBTOYUV420_SHADER_COMP_SPV_LEN = RGBTOYUV420_SHADER_COMP_SPV.len() as _;
+        crate::COMPOSE_SHADER_COMP_SPV_PTR = COMPOSE_SHADER_COMP_SPV.as_ptr();
+        crate::COMPOSE_SHADER_COMP_SPV_LEN = COMPOSE_SHADER_COMP_SPV.len() as _;
     }
 }
