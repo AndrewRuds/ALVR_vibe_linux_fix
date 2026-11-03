@@ -1,5 +1,7 @@
 #include "EncodePipeline.h"
 
+#include <string>
+
 #include "EncodePipelineNvEnc.h"
 #include "EncodePipelineSW.h"
 #include "EncodePipelineVAAPI.h"
@@ -41,10 +43,21 @@ std::unique_ptr<alvr::EncodePipeline> alvr::EncodePipeline::Create(
                 Info("Using NvEnc encoder");
                 return nvenc;
             } catch (std::exception& e) {
+                // The CUDA hint misled when the real cause was a full GPU: the
+                // driver's libcuda (nvidia-utils) is all NvEnc needs, and
+                // installing the CUDA toolkit changes nothing then.
+                std::string what = e.what();
+                bool outOfMemory = what.find("allocate memory") != std::string::npos
+                    || what.find("OutOfDeviceMemory") != std::string::npos
+                    || what.find("Generic error in an external library") != std::string::npos;
                 Error(
-                    "Failed to create NvEnc encoder: %s\nPlease make sure you have installed CUDA "
-                    "runtime.",
-                    e.what()
+                    "Failed to create NvEnc encoder: %s\n%s",
+                    e.what(),
+                    outOfMemory
+                        ? "The GPU is most likely out of video memory (the game or SteamVR is "
+                          "using it). Lower the resolution or the game's texture quality."
+                        : "Make sure the NVIDIA driver's CUDA library (libcuda.so, part of "
+                          "nvidia-utils) is installed."
                 );
             }
         } else if (vendor == Vendor::Amd || vendor == Vendor::Intel) {
